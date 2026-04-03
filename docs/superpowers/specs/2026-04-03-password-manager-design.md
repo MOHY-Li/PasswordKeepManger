@@ -1,7 +1,7 @@
 # PassKeep 密码管理器设计文档
 
 **日期**: 2026-04-03
-**状态**: 设计阶段 v4
+**状态**: 设计阶段 v5
 **作者**: Claude + 用户协作
 
 ---
@@ -148,12 +148,15 @@
 ### 4.3 数据结构
 
 ```rust
+// ============ 数据库存储结构 ============
+
 // 加密后的单个条目存储格式
+// 注意：username 明文存储（不是敏感信息），password 加密存储
 pub struct EncryptedEntry {
     pub id: String,
     pub title: String,                  // 明文：用于数据库索引和搜索
-    pub username_encrypted: Vec<u8>,    // 加密：用户名
-    pub password_encrypted: Vec<u8>,    // 加密：密码
+    pub username: String,               // 明文：用户名通常不是敏感信息
+    pub password_encrypted: Vec<u8>,    // 加密：密码（敏感）
     pub url_encrypted: Option<Vec<u8>>, // 加密：URL
     pub notes_encrypted: Option<Vec<u8>>, // 加密：备注
     pub nonce: [u8; 12],                // AES-GCM nonce（每个条目唯一）
@@ -163,10 +166,10 @@ pub struct EncryptedEntry {
     pub updated_at: i64,
 }
 
-// 主密钥派生参数（使用 HKDF-Extract 扩展）
+// 主密钥派生参数
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct KdfParams {
-    pub salt: [u8; 32],        // HKDF salt
+    pub salt: [u8; 32],        // 数据库盐值（用于 HKDF）
     pub mem_cost_kib: u32,     // 内存成本
     pub time_cost: u32,        // 迭代次数
     pub parallelism: u32,      // 并行度
@@ -180,8 +183,6 @@ pub struct KdfParams {
 // [8-39]   Secret: [u8; 32] - 密钥材料
 // [40-71]  Checksum: [u8; 32] - BLAKE3(secret || version)
 // Total: 72 bytes
-//
-// 校验和使用 BLAKE3（不需要密钥），校验文件完整性。
 pub const KEYFILE_MAGIC: &[u8; 4] = b"PKEY";
 pub const KEYFILE_VERSION: u32 = 1;
 pub const KEYFILE_SIZE: usize = 72;
@@ -212,7 +213,7 @@ pub struct EntryInput {
     pub id: Option<String>,        // None 表示新建，Some 表示更新
     pub title: String,
     pub username: String,           // 明文
-    pub password: String,           // 明文
+    pub password: String,           // 明文（敏感）
     pub url: Option<String>,        // 明文
     pub notes: Option<String>,      // 明文
     pub folder_id: Option<String>,
@@ -220,12 +221,13 @@ pub struct EntryInput {
 }
 
 /// 条目元数据（不含敏感信息，可直接显示）
+/// username 明文存储，不需要解密
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct EntryMetadata {
     pub id: String,
     pub title: String,
-    pub url_preview: Option<String>, // URL 的前 50 字符
-    pub username: String,           // 用户名可明文存储用于识别
+    pub username: String,           // 明文：用户名不是敏感信息
+    pub url_preview: Option<String>, // URL 的前 50 字符（明文）
     pub folder_id: Option<String>,
     pub tags: Vec<String>,
     pub created_at: i64,
@@ -252,7 +254,7 @@ pub struct Entry {
 /// 密码生成器配置
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PasswordGeneratorConfig {
-    /// 密码长度（默认 20）
+    /// 密码长度（默认 20，范围 8-128）
     pub length: u8,
 
     /// 字符集选项
@@ -290,6 +292,30 @@ impl Default for PasswordGeneratorConfig {
         }
     }
 }
+
+// ============ 导入配置 ============
+
+/// 导入选项
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ImportOptions {
+    /// 如何处理 ID 冲突
+    pub conflict_resolution: ConflictResolution,
+
+    /// 是否验证每个条目的加密完整性
+    pub verify_integrity: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum ConflictResolution {
+    /// 跳过冲突的条目
+    Skip,
+    /// 覆盖现有条目
+    Overwrite,
+    /// 为导入的条目生成新 ID
+    Rename,
+    /// 取消整个导入操作
+    Abort,
+}
 ```
 
 ---
@@ -325,27 +351,30 @@ impl Default for PasswordGeneratorConfig {
 }
 ```
 
-**设计理由**：此文件独立于加密数据库，即使密码错误也能读写。攻击者无法通过修改此文件绕过锁定，因为真正的防护是 Argon2id 的计算成本。
-
 ---
 
 ## 6. 主密钥派生
 
-### 6.1 派生公式
-
-使用 HKDF 增强（防止边界攻击）：
+### 6.1 派生公式（使用 HKDF-Extract）
 
 ```rust
-// Step 1: 从密钥文件和主密码提取盐值
-let hkdf_salt = hkdf_extract(
-    ikm = keyfile_secret || kdf_salt,  // 64 字节输入
-    salt = None,                        // 使用默认盐
-); // 输出 32 字节
+use hkdf::Hkdf;
+use sha2::Sha256;
 
-// Step 2: 使用 Argon2id 派生主密钥
+// Step 1: 使用 HKDF-Extract 正确派生 Argon2id 的 salt
+// salt 参数 = 数据库中的 kdf_salt
+// ikm 参数 = 密钥文件内容
+let hkdf = Hkdf::<Sha256>::new(
+    Some(&kdf_salt),           // HKDF salt（来自数据库）
+    &keyfile_secret            // IKM（密钥文件内容）
+);
+let mut argon_salt = [0u8; 32];
+hkdf.extract(&mut argon_salt); // 输出 32 字节
+
+// Step 2: 使用派生的 salt 调用 Argon2id
 master_key = Argon2id(
     password = master_password,
-    salt = hkdf_salt,                   // 32 字节
+    salt = argon_salt,          // 32 字节 HKDF 输出
     mem_cost = kdf_params.mem_cost_kib,
     time_cost = kdf_params.time_cost,
     parallelism = kdf_params.parallelism,
@@ -353,11 +382,10 @@ master_key = Argon2id(
 );
 ```
 
-**说明**：
-- `keyfile_secret`: 32字节，从密钥文件读取
-- `kdf_salt`: 32字节，创建保险库时生成，存储在数据库中
-- HKDF-Extract 提供明确的边界，防止拼接攻击
-- 使用 `hkdf` crate 实现
+**设计说明**：
+- HKDF-Extract 将密钥文件内容（IKM）与数据库盐值（salt）结合
+- 这样即使攻击者获取了数据库和密钥文件，仍然需要主密码
+- 密钥文件的作用是增加熵，防止纯主密码暴力破解
 
 ### 6.2 密钥文件验证流程
 
@@ -425,7 +453,7 @@ CREATE TABLE vault_metadata (
 CREATE TABLE entries (
     id TEXT PRIMARY KEY,
     title TEXT NOT NULL,           -- 明文，用于搜索
-    username_encrypted BLOB NOT NULL,
+    username TEXT NOT NULL,        -- 明文，用户名通常不是敏感信息
     password_encrypted BLOB NOT NULL,
     url_encrypted BLOB,
     notes_encrypted BLOB,
@@ -436,6 +464,13 @@ CREATE TABLE entries (
     updated_at INTEGER NOT NULL,
     FOREIGN KEY (folder_id) REFERENCES folders(id) ON DELETE SET NULL
 );
+
+-- 自动更新 updated_at 触发器
+CREATE TRIGGER update_entries_timestamp
+AFTER UPDATE ON entries
+BEGIN
+    UPDATE entries SET updated_at = unixepoch() WHERE id = NEW.id;
+END;
 
 -- 文件夹表
 CREATE TABLE folders (
@@ -450,8 +485,8 @@ CREATE TABLE folders (
 -- 主密钥校验值（用于验证解锁是否成功）
 CREATE TABLE master_key_check (
     id INTEGER PRIMARY KEY CHECK (id = 1),
-    value_encrypted BLOB NOT NULL,  -- 用 master_key 加密的已知值
-    nonce BLOB NOT NULL UNIQUE       -- 对应的 nonce
+    value_encrypted BLOB NOT NULL,
+    nonce BLOB NOT NULL UNIQUE
 );
 
 -- 数据库版本/迁移历史
@@ -466,6 +501,7 @@ CREATE TABLE schema_migrations (
 ```sql
 -- 搜索优化
 CREATE INDEX idx_entries_title ON entries(title COLLATE NOCASE);
+CREATE INDEX idx_entries_username ON entries(username COLLATE NOCASE);
 CREATE INDEX idx_entries_tags ON entries(tags);
 CREATE INDEX idx_entries_folder ON entries(folder_id);
 
@@ -478,12 +514,10 @@ CREATE INDEX idx_folders_parent ON folders(parent_id);
 当创建新条目时：
 1. 生成随机 12 字节 nonce
 2. 尝试插入到数据库
-3. 如果因 UNIQUE 约束失败（nonce 冲突）：
+3. 如果因 UNIQUE 约束失败：
    - 重新生成 nonce
    - 最多重试 10 次
-   - 10 次后仍失败则返回 `NonceGenerationFailed` 错误
-
-**概率分析**：12 字节随机数的冲突概率约为 2^-96，实际中不可能发生。UNIQUE 约束是防御性编程。
+   - 10 次后仍失败则返回错误
 
 ---
 
@@ -533,11 +567,11 @@ pub async fn create_entry(entry: EntryInput) -> Result<String, PassKeepError>
 #[frb(async)]
 pub async fn get_entry(id: String) -> Result<Entry, PassKeepError>
 
-/// 列出所有条目（仅返回元数据，不解密敏感字段）
+/// 列出所有条目（仅返回元数据，不解密密码）
 #[frb(async)]
 pub async fn list_entries() -> Result<Vec<EntryMetadata>, PassKeepError>
 
-/// 搜索条目
+/// 搜索条目（搜索 title 和 username）
 #[frb(async)]
 pub async fn search_entries(query: String) -> Result<Vec<EntryMetadata>, PassKeepError>
 
@@ -577,6 +611,33 @@ pub fn generate_password(config: PasswordGeneratorConfig) -> Result<String, Pass
 pub fn estimate_password_strength(password: String) -> f64
 ```
 
+### 8.5 导入/导出
+
+```rust
+/// 导出保险库到加密 JSON 文件
+#[frb(async)]
+pub async fn export_vault(
+    output_path: String,
+) -> Result<String, PassKeepError>
+
+/// 从加密 JSON 文件导入保险库
+#[frb(async)]
+pub async fn import_vault(
+    input_path: String,
+    options: ImportOptions,
+) -> Result<ImportResult, PassKeepError>
+
+/// 导入结果统计
+#[derive(Serialize, Deserialize, Debug)]
+pub struct ImportResult {
+    pub imported: usize,           // 成功导入的条目数
+    pub skipped: usize,            // 跳过的条目数
+    pub overwritten: usize,        // 覆盖的条目数
+    pub failed: usize,             // 失败的条目数
+    pub errors: Vec<String>,       // 错误信息
+}
+```
+
 ---
 
 ## 9. 数据流
@@ -596,9 +657,9 @@ Rust: 读取密钥文件，验证 BLAKE3 校验和
     ↓
 Rust: 从数据库读取 kdf_salt 和参数
     ↓
-Rust: hkdf_salt = HKDF-Extract(keyfile_secret || kdf_salt)
+Rust: argon_salt = HKDF-Extract(salt=kdf_salt, ikm=keyfile_secret)
     ↓
-Rust: master_key = Argon2id(master_password, hkdf_salt, params) [异步]
+Rust: master_key = Argon2id(master_password, argon_salt, params) [异步]
     ↓
 Rust: 尝试用 master_key 解密 master_key_check.value_encrypted
     ↓
@@ -623,10 +684,18 @@ Rust FFI: 生成新的 12 字节随机 nonce
 Rust: 尝试插入，检查 nonce 唯一性
     冲突 → 重新生成（最多 10 次）
     ↓
-Rust: FOR EACH sensitive_field:
-        encrypted = AES-256-GCM(plaintext, master_key, nonce)
+Rust: 加密 password, url, notes
     ↓
-storage::save_entry(EncryptedEntry { nonce, encrypted_fields... })
+storage::save_entry({
+    id: new_uuid(),
+    title: entry.title,
+    username: entry.username,  // 明文存储
+    password_encrypted: encrypt(entry.password, master_key, nonce),
+    url_encrypted: encrypt(entry.url, master_key, nonce),
+    notes_encrypted: encrypt(entry.notes, master_key, nonce),
+    nonce: nonce,
+    ...
+})
     ↓
 创建数据库备份（滚动策略）
 ```
@@ -649,9 +718,32 @@ FOR EACH entry IN database:
     ↓
 创建标记备份 vault_<timestamp>_pre_keychange.db
     ↓
-删除所有旧备份（包括 _pre_keychange 之外的备份）
+删除所有旧备份（除了刚创建的标记备份）
     ↓
 更新数据库 metadata
+```
+
+### 9.4 导入流程
+
+```
+用户选择导入文件
+    ↓
+验证文件格式（magic、版本）
+    ↓
+使用当前 master_key 解密文件内容
+    ↓
+FOR EACH entry IN file:
+    检查 ID 是否存在于数据库
+    ↓
+    存在 → 根据 ConflictResolution 处理：
+        - Skip: 跳过此条目
+        - Overwrite: 覆盖现有条目
+        - Rename: 生成新 ID 后插入
+        - Abort: 取消整个导入
+    ↓
+    不存在 → 直接插入
+    ↓
+返回 ImportResult（包含统计）
 ```
 
 ---
@@ -662,9 +754,9 @@ FOR EACH entry IN database:
 
 | 数据 | 加密方式 | 说明 |
 |------|----------|------|
-| 主密码派生密钥 | HKDF + Argon2id | HKDF 防拼接攻击，Argon2id 抗 GPU |
+| 主密码派生密钥 | HKDF-Extract + Argon2id | HKDF 正确使用 salt |
 | 各字段内容 | AES-256-GCM | 每条目独立 nonce，AEAD 模式 |
-| 密钥文件 | 随机 32 字节 | 作为主密码派生的额外输入 |
+| 密钥文件 | 随机 32 字节 | 作为 HKDF IKM |
 | Nonce 生成 | CSPRNG (getrandom) | 每条目 12 字节，UNIQUE 约束 |
 | 密钥文件校验 | BLAKE3 | 32 字节，完整性验证 |
 
@@ -679,9 +771,8 @@ FOR EACH entry IN database:
 ### 10.3 暴力破解防护
 
 ```rust
-// 延迟计算（指数退避，上限 5 分钟）
 fn calculate_lockout_delay(failed_attempts: u32) -> u64 {
-    let exponent = failed_attempts.min(8);  // 2^8 = 256
+    let exponent = failed_attempts.min(8);
     let delay_secs = (1u64 << exponent).min(300);
     delay_secs
 }
@@ -696,40 +787,48 @@ fn calculate_lockout_delay(failed_attempts: u32) -> u64 {
 | 5 | 32 秒 |
 | 6+ | 64 秒 ~ 5 分钟（最大） |
 
-### 10.4 备份策略
+### 10.4 数据字段加密策略
+
+| 字段 | 存储方式 | 理由 |
+|------|----------|------|
+| title | 明文 | 需要搜索，不是敏感信息 |
+| username | 明文 | 需要搜索/显示，通常不是敏感信息（邮箱/用户名） |
+| password | 加密 | 核心敏感信息 |
+| url | 加密 | 可能包含敏感信息或会话 ID |
+| notes | 加密 | 可能包含敏感信息 |
+| tags | 明文 | 需要搜索，不是敏感信息 |
+
+### 10.5 备份策略
 
 | 策略 | 说明 |
 |------|------|
 | 备份频率 | 每次修改操作后 |
 | 保留数量 | 最多 5 个滚动备份 |
-| 命名格式 | `vault_YYYYMMDD_HHMMSS.db` |
 | 清理策略 | 创建新备份时，删除最旧的备份 |
 | 密钥轮换 | 创建 `_pre_keychange` 标记备份后，删除所有其他备份 |
 
-**统一策略**：保留最新的 5 个备份。密钥轮换后，所有旧备份都被视为不安全，因此全部删除（除了刚创建的标记备份）。
-
-### 10.5 安全措施
+### 10.6 安全措施
 
 | 措施 | 实现方式 |
 |------|----------|
-| 内存清理 | 敏感数据使用 `Zeroizing<Vec<u8>>` 包装 |
-| 密钥不落地 | 派生的主密钥只存在于内存，不写入任何文件 |
+| 内存清理 | 敏感数据使用 `Zeroizing<Vec<u8>>` |
+| 密钥不落地 | 派生的主密钥只存在于内存 |
 | 防剪贴板泄露 | 复制后 30 秒自动清除 |
-| 防截屏录屏 | macOS: `NSWindowSharingNone`<br>Windows: `SetWindowDisplayAffinity`<br>Linux: **有限支持**（Wayland 协议限制） |
-| 自动锁定 | 无操作 5 分钟后清除内存中的 master_key |
+| 防截屏录屏 | macOS: `NSWindowSharingNone`<br>Windows: `SetWindowDisplayAffinity`<br>Linux: **不支持** |
+| 自动锁定 | 无操作 5 分钟后锁定 |
 | 防重放攻击 | Nonce 数据库 UNIQUE 约束 |
 
-### 10.6 平台特定说明
+### 10.7 平台特定说明
 
 **剪贴板处理**：
 - **macOS/Windows**: 标准 clipboard API，30 秒后清除
 - **Linux (X11)**: 同时处理 primary selection 和 clipboard
-- **Linux (Wayland)**: 仅 clipboard（Wayland 协议限制）
+- **Linux (Wayland)**: 仅 clipboard（协议限制）
 
 **防截屏**：
 - **macOS**: `NSWindowSharingNone` 完全支持
 - **Windows**: `SetWindowDisplayAffinity` 完全支持
-- **Linux**: **不支持**（X11/Wayland 无标准 API）
+- **Linux**: **不支持**（无标准 API）
 
 ---
 
@@ -741,13 +840,8 @@ fn calculate_lockout_delay(failed_attempts: u32) -> u64 {
 fn open_database(path: &Path) -> Result<Connection, PassKeepError> {
     let conn = Connection::open(path)?;
 
-    // 启用 WAL 模式（更好的并发性）
     conn.execute("PRAGMA journal_mode=WAL", [])?;
-
-    // 启用外键约束
     conn.execute("PRAGMA foreign_keys=ON", [])?;
-
-    // 设置 busy_timeout（等待锁的最长时间）
     conn.execute("PRAGMA busy_timeout=5000", [])?;
 
     Ok(conn)
@@ -758,21 +852,10 @@ fn open_database(path: &Path) -> Result<Connection, PassKeepError> {
 
 | 场景 | 恢复机制 |
 |------|----------|
-| 写入过程中崩溃 | SQLite WAL 自动回滚未完成的事务 |
-| 数据库损坏 | 检测损坏后提示用户从备份恢复 |
-| 密钥文件损坏 | 提示用户从备份恢复（如有） |
-| 应用崩溃重启 | 内存状态丢失，需要重新解锁 |
-
-### 11.3 事务一致性
-
-```rust
-conn.transaction(|tx| {
-    tx.execute(...)?;
-    tx.execute(...)?;
-    create_backup(tx)?;
-    Ok(())
-})?;
-```
+| 写入过程中崩溃 | SQLite WAL 自动回滚 |
+| 数据库损坏 | 提示用户从备份恢复 |
+| 密钥文件损坏 | 提示用户从备份恢复 |
+| 应用崩溃重启 | 需要重新解锁 |
 
 ---
 
@@ -795,7 +878,7 @@ conn.transaction(|tx| {
     {
       "id": "uuid",
       "title": "明文标题",
-      "username_encrypted": "base64...",
+      "username": "明文用户名",
       "password_encrypted": "base64...",
       "url_encrypted": "base64...",
       "notes_encrypted": "base64...",
@@ -815,12 +898,30 @@ conn.transaction(|tx| {
 }
 ```
 
+### 12.2 导出流程
+
+```
+用户请求导出
+    ↓
+验证 vault 已解锁
+    ↓
+使用当前 master_key 加密所有敏感字段
+    ↓
+序列化为 JSON
+    ↓
+写入文件（带时间戳）
+    ↓
+返回文件路径
+```
+
 ---
 
 ## 13. 错误处理
 
 ```rust
-#[derive(Debug, thiserror::Error)]
+use thiserror::Error;
+
+#[derive(Debug, Error)]
 pub enum PassKeepError {
     // 认证相关
     #[error("Incorrect master password")]
@@ -867,6 +968,16 @@ pub enum PassKeepError {
     #[error("Backup failed")]
     BackupFailed,
 
+    // 导入导出
+    #[error("Invalid export file format")]
+    InvalidExportFormat,
+
+    #[error("Export file version mismatch")]
+    ExportVersionMismatch,
+
+    #[error("Import cancelled due to conflicts")]
+    ImportCancelled,
+
     // 系统相关
     #[error("Unauthorized access")]
     UnauthorizedAccess,
@@ -908,69 +1019,25 @@ passkeep/
 │   ├── Cargo.toml
 │   ├── src/
 │   │   ├── ffi/               # FFI 导出层
-│   │   │   └── lib.rs
 │   │   ├── crypto/            # 加密模块
-│   │   │   ├── mod.rs
-│   │   │   ├── aes.rs
-│   │   │   ├── argon2.rs
-│   │   │   ├── hkdf.rs
-│   │   │   └── rng.rs
 │   │   ├── storage/           # 存储模块
-│   │   │   ├── mod.rs
-│   │   │   ├── database.rs
-│   │   │   └── schema.sql
 │   │   ├── models/            # 数据模型
-│   │   │   ├── mod.rs
-│   │   │   ├── vault.rs
-│   │   │   ├── entry.rs
-│   │   │   └── password.rs
 │   │   ├── import_export/     # 导入导出
-│   │   │   ├── mod.rs
-│   │   │   └── json_format.rs
 │   │   └── lib.rs
 │   └── tests/                 # 集成测试
-│       ├── crypto_tests.rs
-│       └── fuzz/              # 模糊测试
-│           ├── encrypt_target.rs
-│           └── kdf_target.rs
 │
 ├── passkeep-app/               # Flutter 应用
 │   ├── pubspec.yaml
 │   ├── lib/
-│   │   ├── main.dart
 │   │   ├── screens/           # 页面
-│   │   │   ├── home/
-│   │   │   ├── vault/
-│   │   │   ├── settings/
-│   │   │   └── password_generator/
 │   │   ├── widgets/           # 通用组件
 │   │   ├── providers/         # Riverpod providers
 │   │   ├── services/          # 服务层
-│   │   │   ├── vault_service.dart
-│   │   │   └── clipboard_service.dart
 │   │   ├── models/            # Dart 数据模型
-│   │   ├── l10n/              # 国际化
-│   │   └── ffi/               # FFI 绑定（自动生成）
-│   ├── test/                  # 测试
-│   │   ├── widgets/
-│   │   └── integration/
-│   └── linux/
-│       ├── flutter/
-│       └── packages/          # Linux 特定资源
-│
-├── .github/                    # CI/CD
-│   └── workflows/
-│       ├── rust-audit.yml     # 依赖安全审计
-│       ├── test.yml
-│       └── release.yml
+│   │   └── ffi/               # FFI 绑定
+│   └── test/                  # 测试
 │
 ├── docs/                       # 文档
-│   └── superpowers/specs/
-│
-├── scripts/                    # 构建脚本
-│   ├── build-all.sh
-│   └── audit-deps.sh
-│
 └── README.md
 ```
 
@@ -985,11 +1052,12 @@ passkeep/
 | `aes-gcm` | ^0.10 | AES-256-GCM 加密 |
 | `argon2` | ^0.5 | 密钥派生 |
 | `hkdf` | ^0.12 | HKDF-Extract |
+| `sha2` | ^0.10 | HKDF 哈希函数 |
 | `blake3` | ^1.5 | 密钥文件校验和 |
 | `rusqlite` | ^0.30 | SQLite 数据库 |
 | `zeroize` | ^1.6 | 安全内存清理 |
 | `serde` | ^1.0 | 序列化 |
-| `thiserror` | ^1.0 | 错误处理 |
+| `thiserror` | ^2.0 | 错误处理 |
 | `getrandom` | ^0.2 | 随机数生成 |
 | `flutter_rust_bridge` | ^2.0 | FFI 代码生成 |
 
@@ -999,7 +1067,7 @@ passkeep/
 |------|------|------|
 | `flutter_rust_bridge` | ^2.0 | FFI 代码生成 |
 | `riverpod` | ^2.4 | 状态管理 |
-| `flutter_local_notifications` | ^16.0 | 剪贴板清除通知 |
+| `super_clipboard` | ^0.8 | 剪贴板操作（跨平台） |
 
 ---
 
@@ -1011,28 +1079,16 @@ passkeep/
 |------|----------|----------|------|
 | Rust Core | 单元测试 | 90%+ | cargo test |
 | Rust Core | 集成测试 | 关键流程 | cargo test |
-| Rust Core | 模糊测试 | 加密/解密 | libFuzzer |
 | Flutter App | 单元测试 | 80%+ | flutter test |
 | Flutter App | Widget 测试 | 主要页面 | flutter test |
-| Flutter App | 集成测试 | 完整流程 | integration_test |
 
 ### 17.2 关键测试场景
 
 - **加密往返**：明文 → 加密 → 解密 → 明文
-- **密钥派生**：相同输入产生相同密钥
+- **密钥派生**：HKDF + Argon2id 正确性
 - **nonce 唯一性**：重用 nonce 应返回错误
-- **导入/导出**：导出后导入验证完整性
-- **FFI 内存**：长时间运行无内存泄漏
-- **nonce 冲突处理**：模拟冲突后重新生成
-
-### 17.3 模糊测试目标
-
-| 目标 | 输入范围 | 预期行为 |
-|------|----------|----------|
-| 加密函数 | 任意长度字节串 | 绝不崩溃 |
-| KDF 函数 | 任意密码长度 | 绝不崩溃 |
-| 数据库解析 | 损坏的 SQLite 文件 | 返回错误 |
-| 密钥文件解析 | 任意字节文件 | 返回错误 |
+- **导入导出**：格式验证、冲突处理
+- **updated_at**：触发器自动更新
 
 ---
 
@@ -1055,14 +1111,6 @@ jobs:
     - cargo audit
 ```
 
-### 18.2 安全审计
-
-| 工具 | 频率 | 作用 |
-|------|------|------|
-| `cargo audit` | 每次 CI | 检查 Rust 依赖漏洞 |
-| `cargo-deny` | 每周 | 许可证检查 |
-| 手动代码审查 | 每个 PR | 安全敏感代码双人审查 |
-
 ---
 
 ## 19. 用户体验
@@ -1073,6 +1121,7 @@ jobs:
 | 忘记主密码 | 明确警告：数据无法恢复 |
 | 数据库损坏 | 自动检测备份文件，提示恢复 |
 | 密码强度提示 | 实时显示熵值 |
+| 导入冲突 | 让用户选择处理方式 |
 
 ---
 

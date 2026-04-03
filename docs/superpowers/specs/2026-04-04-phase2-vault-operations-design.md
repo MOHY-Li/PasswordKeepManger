@@ -220,17 +220,7 @@ UPDATE entries SET notes_nonce = randomblob(12) WHERE notes_encrypted IS NOT NUL
 
 -- 注意：SQLite 不支持 ALTER COLUMN SET NOT NULL
 -- 新建条目时在应用层强制校验 nonce 不为空
--- 或使用 CHECK 约束：ALTER TABLE entries ADD COLUMN password_nonce_check CHECK (password_nonce IS NOT NULL);
-
--- 创建迁移记录
-INSERT INTO schema_migrations (version, applied_at)
-VALUES (2, CAST(strftime('%s', 'now') AS INTEGER));
 ```
-
-**安全说明**：
-- 使用 `randomblob(12)` 生成加密安全的 nonce（SQLite 内置）
-- 全零 nonce 违反 AES-GCM 安全要求，必须使用随机值
-- 新建条目时必须提供 nonce，应用层强制校验
 
 ### 3.2 加密数据存储格式
 
@@ -325,6 +315,21 @@ impl LockState {
 }
 ```
 
+**VaultManager 内部方法**：
+```rust
+impl VaultManager {
+    // 内部使用：在读锁内执行只读操作
+    fn with_session<F, R>(&self, handle: VaultHandle, f: F) -> Result<R, PassKeepError>
+    where
+        F: FnOnce(&VaultSession) -> Result<R, PassKeepError>;
+    
+    // 内部使用：在写锁内执行可变操作
+    fn with_session_mut<F, R>(&self, handle: VaultHandle, f: F) -> Result<R, PassKeepError>
+    where
+        F: FnOnce(&mut VaultSession) -> Result<R, PassKeepError>;
+}
+```
+
 ### 4.3 EntryService 模块
 
 **文件**: `passkeep-core/src/storage/entry_service.rs`
@@ -336,8 +341,8 @@ impl LockState {
 **核心 API**:
 ```rust
 impl EntryService {
-    // 接收 VaultDb 和 MasterKey 引用
-    pub fn new(db: VaultDb, master_key: &MasterKey) -> Self;
+    // 接收 VaultDb 和 MasterKey（按值转移，获取所有权）
+    pub fn new(db: VaultDb, master_key: MasterKey) -> Self;
     
     // 注意：使用 &self 但内部通过 Arc<Mutex<>> 修改数据库
     // 这是 Rust 惯用的模式，对外不可变接口，内部可变性
@@ -350,6 +355,26 @@ impl EntryService {
     
     // 批量操作：在单个事务中执行，原子性保证
     pub fn create_batch(&self, entries: &[EntryInput]) -> Result<Vec<String>, PassKeepError>;
+}
+```
+
+**MasterKey 类型定义**：
+```rust
+use zeroize::Zeroize;
+
+/// 主密钥类型（32 字节，自动清零）
+#[derive(Zeroize)]
+pub struct MasterKey(pub [u8; 32]);
+
+// 为方便使用，实现一些方法
+impl MasterKey {
+    pub fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+    
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
 }
 ```
 
@@ -540,11 +565,24 @@ use dirs::data_dir;
 
 fn backup_dir() -> PathBuf {
     let base = data_dir()
-        .unwrap_or_else(|| PathBuf::from("."));  // 容器环境降级到当前目录
+        .unwrap_or_else(|| std::env::temp_dir());  // 降级到系统临时目录（通常可写）
     let mut path = base;
     path.push("passkeep");
     path.push("backups");
     path
+}
+```
+
+**VaultDb 初始化**：
+```rust
+impl VaultDb {
+    pub fn new(conn: Arc<Mutex<rusqlite::Connection>>) -> Self {
+        // 在连接初始化时启用 WAL 模式
+        let conn = conn.lock().unwrap();
+        conn.execute("PRAGMA journal_mode=WAL", []).ok();
+        drop(conn);
+        Self { conn }
+    }
 }
 ```
 
@@ -558,7 +596,7 @@ pub struct BackupManager {
 
 impl BackupManager {
     // 检查是否需要备份（同一秒内只备份一次）
-    // 使用 compare_exchange_weak 避免 TOCTOU 竞态
+    // 使用 compare_exchange_weak 原子操作避免 TOCTOU 竞态
     fn should_backup(&self) -> bool {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -567,17 +605,20 @@ impl BackupManager {
         
         let mut last = self.last_backup_at.load(Ordering::Acquire);
         while now > last {
+            // 尝试原子更新 last_backup_at 为 now
+            // 如果 last 被其他线程修改过，compare_exchange_weak 会返回 Err 中的实际值
+            // 这确保只有一个线程能成功更新并执行备份
             match self.last_backup_at.compare_exchange_weak(
                 last,
                 now,
-                Ordering::AcqRel,
-                Ordering::Acquire,
+                Ordering::AcqRel,  // 成功时写内存
+                Ordering::Acquire, // 失败时读取最新值
             ) {
-                Ok(_) => return true,   // 成功更新时间戳
-                Err(actual) => last = actual,  // 其他线程已更新，重试
+                Ok(_) => return true,   // 我们成功更新了 last，现在 > last，执行备份
+                Err(actual) => last = actual,  // 其他线程已更新，用新值重试
             }
         }
-        false
+        false  // now <= last，已在同一秒内备份过
     }
 }
 ```

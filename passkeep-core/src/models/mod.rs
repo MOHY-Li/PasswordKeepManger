@@ -1,8 +1,9 @@
 //! Data models for password entries and vault metadata
 
-pub mod entry;
 pub mod vault;
+pub mod entry;
+pub mod password;
 
-// Re-exports
+pub use vault::{KdfParams, VaultMetadata};
 pub use entry::{Entry, EntryInput, EntryMetadata};
-pub use vault::VaultMetadata;
+pub use password::{PasswordGeneratorConfig, CharacterSets};

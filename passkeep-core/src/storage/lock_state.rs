@@ -35,7 +35,7 @@ impl LockState {
         }
         let base = 30i64;
         // Calculate 30 * 2^(failed_attempts - 3), capped at 512
-        let exponent = (self.failed_attempts - 3).min(9) as u32; // Cap exponent so 30 * 2^9 = 30 * 512 = 15360, still capped
+        let exponent = (self.failed_attempts - 3).min(9); // Cap exponent so 30 * 2^9 = 30 * 512 = 15360, still capped
         (base * (1 << exponent)).min(512)
     }
 
@@ -60,6 +60,10 @@ impl LockState {
     pub fn record_success(&mut self) {
         self.failed_attempts = 0;
         self.lock_until = None;
+        self.last_attempt_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
     }
 
     /// 检查是否被锁定

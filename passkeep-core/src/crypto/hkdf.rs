@@ -31,11 +31,11 @@ pub fn expand(
 pub fn expand_with_info(
     salt: &[u8; 32],
     ikm: &[u8; 32],
-    info: &[u8],
+    info: &[&[u8]],
     output: &mut [u8; 32],
 ) -> Result<(), PassKeepError> {
     let hkdf = Hkdf::<Sha256>::new(Some(salt), ikm);
-    hkdf.expand(info, output)
+    hkdf.expand_multi_info(info, output)
         .map_err(|_| PassKeepError::KeyDerivationFailed)?;
     Ok(())
 }
@@ -66,8 +66,8 @@ mod tests {
         let mut out1 = [0u8; 32];
         let mut out2 = [0u8; 32];
 
-        expand_with_info(&salt, &ikm, b"info-a", &mut out1).unwrap();
-        expand_with_info(&salt, &ikm, b"info-b", &mut out2).unwrap();
+        expand_with_info(&salt, &ikm, &[b"info-a"], &mut out1).unwrap();
+        expand_with_info(&salt, &ikm, &[b"info-b"], &mut out2).unwrap();
 
         assert_ne!(out1, out2);
     }

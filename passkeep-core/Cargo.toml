@@ -10,7 +10,7 @@ hkdf = "0.12"
 sha2 = "0.10"
 blake3 = "1.5"
 rusqlite = { version = "0.30", features = ["bundled"] }
-zeroize = "1.7"
+zeroize = { version = "1.7", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"

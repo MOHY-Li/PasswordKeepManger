@@ -7,12 +7,14 @@ pub mod ffi;
 pub mod import_export;
 pub mod models;
 pub mod storage;
+pub mod vault;
 
 // 重新导出常用类型
 pub use crypto::{KdfParams, MasterKey};
 pub use models::{Entry, EntryInput, EntryMetadata, VaultMetadata};
 pub use storage::error::PassKeepError;
 pub use storage::Database;
+pub use vault::{VaultHandle, VaultManager, VaultSession, VaultDb};
 
 /// 库版本
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

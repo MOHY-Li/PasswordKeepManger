@@ -1,4 +1,7 @@
 //! Database operations
+//!
+//! TODO: This file belongs to future storage implementation tasks.
+//! It is included here as scaffolding/preview of upcoming work.
 
 use crate::storage::error::PassKeepError;
 

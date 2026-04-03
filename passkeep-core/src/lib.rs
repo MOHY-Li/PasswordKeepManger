@@ -6,6 +6,7 @@ pub mod models;
 pub mod crypto;
 pub mod storage;
 pub mod import_export;
+pub mod ffi;
 
 // 重新导出常用类型
 pub use models::{Entry, EntryInput, EntryMetadata, VaultMetadata};

@@ -1,4 +1,7 @@
 //! Key derivation function parameters
+//!
+//! TODO: This file belongs to future crypto implementation tasks (Task 5/6).
+//! It is included here as scaffolding/preview of upcoming work.
 
 use serde::{Deserialize, Serialize};
 

@@ -1,4 +1,7 @@
 //! Master key management
+//!
+//! TODO: This file belongs to future crypto implementation tasks.
+//! It is included here as scaffolding/preview of upcoming work.
 
 use serde::{Deserialize, Serialize};
 

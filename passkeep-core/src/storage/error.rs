@@ -1,4 +1,7 @@
 //! Error types for passkeep-core
+//!
+//! TODO: This file belongs to Task 2 (Error Handling System).
+//! It is included here as scaffolding/preview of upcoming work.
 
 use thiserror::Error;
 

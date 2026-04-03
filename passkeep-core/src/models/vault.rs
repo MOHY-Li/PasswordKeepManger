@@ -1,4 +1,7 @@
 //! Vault metadata model
+//!
+//! TODO: This file belongs to Task 3 (Data Models Definition).
+//! It is included here as scaffolding/preview of upcoming work.
 
 use serde::{Deserialize, Serialize};
 

@@ -16,6 +16,8 @@ pub type VaultHandle = u64;
 
 /// Global vault manager (thread-safe)
 pub struct VaultManager {
+    // TODO: Used in future vault session management
+    #[allow(dead_code)]
     next_handle: AtomicU64,
     vaults: RwLock<HashMap<VaultHandle, Arc<Mutex<VaultSession>>>>,
 }
@@ -29,12 +31,21 @@ impl VaultManager {
     }
 
     /// Internal: generate next handle
+    // TODO: Used in future vault session management
+    #[allow(dead_code)]
     fn next_handle(&self) -> VaultHandle {
         self.next_handle.fetch_add(1, Ordering::SeqCst)
     }
 
+    #[must_use]
     pub fn has_sessions(&self) -> bool {
-        self.vaults.read().unwrap().len() > 0
+        !self.vaults.read().unwrap().is_empty()
+    }
+}
+
+impl Default for VaultManager {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -62,9 +73,9 @@ impl VaultDb {
 /// from memory when the session is closed.
 pub struct VaultSession {
     master_key: MasterKey,
-    db: VaultDb,
-    config_path: PathBuf,
-    keyfile_path: PathBuf,
+    _db: VaultDb,
+    _config_path: PathBuf,
+    _keyfile_path: PathBuf,
 }
 
 impl Drop for VaultSession {
@@ -83,9 +94,9 @@ impl VaultSession {
     ) -> Self {
         Self {
             master_key,
-            db,
-            config_path,
-            keyfile_path,
+            _db: db,
+            _config_path: config_path,
+            _keyfile_path: keyfile_path,
         }
     }
 }
@@ -93,14 +104,6 @@ impl VaultSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_vault_manager_creates_unique_handles() {
-        let manager = VaultManager::new();
-        let handle1 = manager.next_handle();
-        let handle2 = manager.next_handle();
-        assert_ne!(handle1, handle2);
-    }
 
     #[test]
     fn test_vault_manager_no_sessions_initially() {

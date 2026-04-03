@@ -40,6 +40,9 @@ impl Database {
             stmt.execute([now])?;
         } // Drop stmt before moving conn
 
+        // Apply v2 migration
+        crate::storage::migrations::apply_v2_migration(&conn)?;
+
         Ok(Self { conn })
     }
 

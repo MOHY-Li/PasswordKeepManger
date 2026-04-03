@@ -3,7 +3,9 @@
 pub mod database;
 pub mod error;
 pub mod lock_state;
+pub mod migrations;
 
 // Re-exports
 pub use database::Database;
 pub use error::PassKeepError;
+pub use migrations::apply_v2_migration;

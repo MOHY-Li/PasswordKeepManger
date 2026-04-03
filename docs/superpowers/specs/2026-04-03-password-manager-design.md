@@ -1,7 +1,7 @@
 # PassKeep 密码管理器设计文档
 
 **日期**: 2026-04-03
-**状态**: 设计阶段 v2
+**状态**: 设计阶段 v3
 **作者**: Claude + 用户协作
 
 ---
@@ -35,9 +35,36 @@
 
 ---
 
-## 2. 架构设计
+## 2. 威胁模型
 
-### 2.1 整体架构
+### 2.1 威胁场景
+
+| 威胁 | 防护措施 | 备注 |
+|------|----------|------|
+| 硬盘被盗/设备丢失 | 数据库文件加密 | 需要 master_key 解密 |
+| 内存转储攻击 | 敏感数据使用 `zeroize` | 进程退出时清理 |
+| 剪贴板窃取 | 30秒自动清除 | 限制泄露窗口 |
+| 截屏/录屏 | 窗口防截屏属性 | OS 级别防护 |
+| 暴力破解主密码 | Argon2id 高成本 KDF | 延迟攻击 |
+| 密钥文件被复制 | 主密码仍需输入 | 双因素认证 |
+| 数据库文件替换 | HMAC 完整性校验 | 检测篡改 |
+| 时间攻击 | 常量时间比较 | 密码验证 |
+| 侧信道攻击（缓存） | 使用常数时间密码原语 | 有限防护 |
+
+### 2.2 不在防护范围内的威胁
+
+| 威胁 | 原因 |
+|------|------|
+| 键盘记录器 | 主密码输入时可能被记录 |
+| 内存完整的恶意软件 | 如有 root/admin 权限，可读取进程内存 |
+| 物理胁迫 | 无法抵抗强迫交出密码 |
+| 丢设备后未检测的备份 | 用户需要手动清理旧备份 |
+
+---
+
+## 3. 架构设计
+
+### 3.1 整体架构
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -80,24 +107,25 @@
 │  │                   Storage Layer                             │   │
 │  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │   │
 │  │  │   SQLite     │  │   File I/O   │  │   Export/Import  │  │   │
-│  │  │   Database   │  │   (Key File) │  │   (JSON/CSV)     │  │   │
+│  │  │   Database   │  │(Key+Security)│  │   (Encrypted)    │  │   │
 │  │  └──────────────┘  └──────────────┘  └──────────────────┘  │   │
 │  └─────────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-### 2.2 核心原则
+### 3.2 核心原则
 
 1. **安全边界**：所有加密/解密操作在 Rust 中完成，Flutter 只处理 UI
 2. **最小权限**：Rust 核心库只暴露必要的 FFI 接口
 3. **内存安全**：敏感数据使用 `zeroize` 清理
 4. **逐条目加密**：每条密码独立加密，避免一次性解密整个数据库
+5. **防御深度**：多层安全防护，任何一层失效不代表系统崩溃
 
 ---
 
-## 3. 核心组件
+## 4. 核心组件
 
-### 3.1 Rust Core Library (`passkeep-core/`)
+### 4.1 Rust Core Library (`passkeep-core/`)
 
 | 模块 | 职责 |
 |------|------|
@@ -107,7 +135,7 @@
 | `models/` | Vault、Entry、Folder 等数据模型 |
 | `import_export/` | 导入/导出功能 |
 
-### 3.2 Flutter Desktop App (`passkeep-app/`)
+### 4.2 Flutter Desktop App (`passkeep-app/`)
 
 | 层级 | 组件 |
 |------|------|
@@ -116,17 +144,17 @@
 | **FFI Bridge** | `passkeep_ffi.dart` - 使用 `flutter_rust_bridge` 自动生成 |
 | **Services** | VaultService, ClipboardService |
 
-### 3.3 数据结构
+### 4.3 数据结构
 
 ```rust
 // 加密后的单个条目存储格式
 pub struct EncryptedEntry {
-    pub id: String,                    // 明文：用于数据库索引
-    pub title: String,                  // 明文：用于搜索显示
+    pub id: String,
+    pub title: String,                  // 明文：用于数据库索引和搜索
     pub username_encrypted: Vec<u8>,    // 加密：用户名
     pub password_encrypted: Vec<u8>,    // 加密：密码
     pub url_encrypted: Option<Vec<u8>>, // 加密：URL
-    pub notes_encrypted: Option<Vec<u<u8>>>, // 加密：备注
+    pub notes_encrypted: Option<Vec<u8>>, // 加密：备注
     pub nonce: [u8; 12],                // AES-GCM nonce（每个条目唯一）
     pub folder_id: Option<String>,      // 明文：分类ID
     pub tags: Vec<String>,              // 明文：标签
@@ -135,6 +163,7 @@ pub struct EncryptedEntry {
 }
 
 // 主密钥派生参数
+#[derive(Serialize, Deserialize, Clone)]
 pub struct KdfParams {
     pub salt: [u8; 32],        // 随机盐值
     pub mem_cost_kib: u32,     // 内存成本（默认 262144 KiB = 256MB）
@@ -142,11 +171,24 @@ pub struct KdfParams {
     pub parallelism: u32,      // 并行度（默认 4）
 }
 
-// 密钥文件格式
+// 密钥文件磁盘格式
+//
+// 文件结构 (字节序: Little Endian):
+// [0-3]    Magic: "PKEY" (0x59454B50)
+// [4-7]    Version: u32 (当前 = 1)
+// [8-39]   Secret: [u8; 32] - 密钥材料
+// [40-75]  Checksum: [u8; 36] - BLAKE3(secret + version)
+// Total: 76 bytes
+//
+// 校验和使用 BLAKE3（不需要密钥），校验文件完整性。
+pub const KEYFILE_MAGIC: &[u8; 4] = b"PKEY";
+pub const KEYFILE_VERSION: u32 = 1;
+pub const KEYFILE_SIZE: usize = 76;
+
 pub struct KeyFile {
     pub version: u32,
-    pub secret: [u8; 32],      // 32字节随机密钥
-    pub checksum: [u8; 32],    // HMAC-SHA256 校验和
+    pub secret: [u8; 32],      // 32字节随机密钥材料
+    pub checksum: [u8; 36],    // BLAKE3(secret || version) 输出前36字节
 }
 
 // 保险库元数据
@@ -157,13 +199,104 @@ pub struct VaultMetadata {
     pub updated_at: i64,
     pub entry_count: u32,
 }
+
+// 主密钥（内存中，使用 Zeroizing 包装）
+pub type MasterKey = Zeroizing<[u8; 32]>;
 ```
 
 ---
 
-## 4. 数据库设计
+## 5. 文件系统布局
 
-### 4.1 SQLite 表结构
+### 5.1 数据目录结构
+
+```
+~/.passkeep/                          # 配置目录
+├── database/
+│   ├── vault.db                      # 主数据库（加密内容）
+│   └── vault.db.lock                 # SQLite 锁文件
+├── keys/
+│   └── keyfile.pkey                  # 密钥文件
+├── security/
+│   └── lock_state.json               # 暴力破解防护状态（明文）
+├── backups/
+│   ├── vault_20260403_143000.db      # 时间戳命名的备份
+│   └── vault_20260403_120000.db
+└── exports/
+    └── export_20260403.json.enc      # 加密导出文件
+```
+
+### 5.2 暴力破解防护状态文件
+
+```json
+// security/lock_state.json (明文，不包含敏感信息)
+{
+  "failed_attempts": 2,
+  "lock_until": 1712188800,
+  "last_attempt_at": 1712188600
+}
+```
+
+**设计理由**：此文件独立于加密数据库，即使密码错误也能读写。攻击者无法通过修改此文件绕过锁定，因为真正的防护是 Argon2id 的计算成本。
+
+---
+
+## 6. 主密钥派生
+
+### 6.1 派生公式
+
+```
+master_key = Argon2id(
+    password = master_password,
+    salt = keyfile_secret || kdf_salt,
+    mem_cost = 256 MB,
+    time_cost = 3,
+    parallelism = 4,
+    output_length = 32 bytes
+)
+```
+
+**说明**：
+- `keyfile_secret`: 32字节，从密钥文件读取
+- `kdf_salt`: 32字节，创建保险库时生成，存储在数据库中
+- 两者拼接形成 64 字节的盐值
+
+### 6.2 密钥文件验证流程
+
+```rust
+fn validate_keyfile(path: &Path) -> Result<KeyFile, PassKeepError> {
+    let data = fs::read(path)?;
+
+    // 1. 检查 magic
+    if data[0..4] != KEYFILE_MAGIC {
+        return Err(PassKeepError::KeyFileInvalid);
+    }
+
+    // 2. 检查版本
+    let version = u32::from_le_bytes(data[4..8].try_into()?);
+    if version != KEYFILE_VERSION {
+        return Err(PassKeepError::KeyFileVersionMismatch);
+    }
+
+    // 3. 提取 secret 和 checksum
+    let secret = data[8..40].try_into()?;
+    let stored_checksum = &data[40..76];
+
+    // 4. 计算并验证 checksum
+    let computed_checksum = blake3::hash(&[secret, &version.to_le_bytes()].concat());
+    if computed_checksum.as_bytes()[0..36] != stored_checksum {
+        return Err(PassKeepError::KeyFileCorrupted);
+    }
+
+    Ok(KeyFile { version, secret, checksum: stored_checksum.try_into()? })
+}
+```
+
+---
+
+## 7. 数据库设计
+
+### 7.1 SQLite 表结构
 
 ```sql
 -- 保险库元数据表（单行）
@@ -186,7 +319,7 @@ CREATE TABLE entries (
     password_encrypted BLOB NOT NULL,
     url_encrypted BLOB,
     notes_encrypted BLOB,
-    nonce BLOB NOT NULL,           -- 12 bytes, unique per entry
+    nonce BLOB NOT NULL UNIQUE,    -- 12 bytes, UNIQUE 约束防止重用
     folder_id TEXT,
     tags TEXT,                     -- JSON 数组，明文
     created_at INTEGER NOT NULL,
@@ -204,11 +337,11 @@ CREATE TABLE folders (
     FOREIGN KEY (parent_id) REFERENCES folders(id) ON DELETE CASCADE
 );
 
--- 暴力破解防护表
-CREATE TABLE security_state (
+-- 主密钥校验值（用于验证解锁是否成功）
+CREATE TABLE master_key_check (
     id INTEGER PRIMARY KEY CHECK (id = 1),
-    failed_attempts INTEGER NOT NULL DEFAULT 0,
-    lock_until INTEGER NOT NULL DEFAULT 0  -- Unix timestamp
+    value_encrypted BLOB NOT NULL,  -- 用 master_key 加密的已知值
+    nonce BLOB NOT NULL UNIQUE       -- 对应的 nonce
 );
 
 -- 数据库版本/迁移历史
@@ -218,7 +351,7 @@ CREATE TABLE schema_migrations (
 );
 ```
 
-### 4.2 索引设计
+### 7.2 索引设计
 
 ```sql
 -- 搜索优化
@@ -232,96 +365,169 @@ CREATE INDEX idx_folders_parent ON folders(parent_id);
 
 ---
 
-## 5. 数据流
+## 8. FFI 接口规范
 
-### 5.1 解锁流程
+### 8.1 初始化与解锁
 
-```
-用户输入主密码 + 读取密钥文件
-    ↓
-Rust: storage::get_kdf_params() → 从数据库读取 salt 和参数
-    ↓
-Rust: crypto::derive_master_key(
-        master_password,
-        key_file_secret,
-        salt,
-        mem_cost, time_cost, parallelism
-    ) → 使用 Argon2id 派生
-    ↓
-Rust: crypto::decrypt_master_keycheck(encrypted_check, master_key)
-    ↓
-成功 → 在内存中保留 master_key (Zeroizing 类型)
-      → 重置 failed_attempts 计数
-失败 → failed_attempts++, 计算延迟时间
-```
+```rust
+// 初始化新的保险库
+#[frb(sync)]
+pub fn init_vault(
+    config_path: String,
+    master_password: String,
+    keyfile_path: String,
+    kdf_params: KdfParams,
+) -> Result<(), PassKeepError>
 
-### 5.2 保存密码流程
+// 解锁现有保险库
+#[frb(sync)]
+pub fn unlock_vault(
+    config_path: String,
+    master_password: String,
+    keyfile_path: String,
+) -> Result<VaultMetadata, PassKeepError>
 
-```
-Flutter UI → VaultService.addEntry(plaintext_entry)
-    ↓
-Rust FFI: 生成新的 12 字节随机 nonce
-    ↓
-Rust: crypto::encrypt_field(plaintext, master_key, nonce)
-    ↓
-storage::save_entry(EncryptedEntry { nonce, encrypted_fields... })
-    ↓
-自动创建数据库备份
+// 锁定保险库（清除内存中的密钥）
+#[frb(sync)]
+pub fn lock_vault()
+
+// 检查锁定状态
+#[frb(sync)]
+pub fn is_locked() -> bool
 ```
 
-### 5.3 读取密码流程
+### 8.2 条目操作
 
-```
-Flutter UI → VaultService.getEntry(id)
-    ↓
-Rust FFI → storage::load_entry(id)
-    ↓
-crypto::decrypt_field(encrypted_data, master_key, nonce)
-    ↓
-返回明文 Entry
-    ↓
-Flutter: 显示 + 自动复制到剪贴板（30秒后清除）
+```rust
+// 创建条目
+#[frb(sync)]
+pub fn create_entry(entry: EntryInput) -> Result<String, PassKeepError>
+
+// 获取条目（返回解密后的明文）
+#[frb(sync)]
+pub fn get_entry(id: String) -> Result<Entry, PassKeepError>
+
+// 列出所有条目（仅返回元数据，不解密敏感字段）
+#[frb(sync)]
+pub fn list_entries() -> Result<Vec<EntryMetadata>, PassKeepError>
+
+// 搜索条目
+#[frb(sync)]
+pub fn search_entries(query: String) -> Result<Vec<EntryMetadata>, PassKeepError>
+
+// 更新条目
+#[frb(sync)]
+pub fn update_entry(id: String, entry: EntryInput) -> Result<(), PassKeepError>
+
+// 删除条目
+#[frb(sync)]
+pub fn delete_entry(id: String) -> Result<(), PassKeepError>
 ```
 
-### 5.4 密钥轮换流程（修改主密码）
+### 8.3 密钥轮换
 
-```
-用户请求修改主密码
-    ↓
-验证旧主密码（通过现有 master_key 解密检查）
-    ↓
-用户输入新主密码
-    ↓
-使用新主密码 + 原密钥文件 派生 new_master_key
-    ↓
-FOR EACH entry:
-    用旧 master_key 解密
-    用新 master_key 重新加密（生成新 nonce）
-    ↓
-更新数据库中的 kdf_params（可选：生成新 salt）
-    ↓
-备份数据库（轮换前）
+```rust
+// 修改主密码
+#[frb(sync)]
+pub fn change_master_password(
+    old_password: String,
+    new_password: String,
+) -> Result<(), PassKeepError>
 ```
 
 ---
 
-## 6. 安全设计
+## 9. 数据流
 
-### 6.1 加密方案
+### 9.1 解锁流程（含暴力破解防护）
+
+```
+用户输入主密码 + 选择密钥文件
+    ↓
+Rust: 读取 security/lock_state.json
+    ↓
+检查当前时间 < lock_until?
+    YES → 返回 VaultLocked 错误，显示剩余时间
+    NO  → 继续
+    ↓
+Rust: 读取密钥文件，验证 BLAKE3 校验和
+    ↓
+Rust: 从数据库读取 kdf_salt 和参数
+    ↓
+Rust: master_key = Argon2id(
+        master_password,
+        keyfile_secret || kdf_salt,
+        params
+    )
+    ↓
+Rust: 尝试用 master_key 解密 master_key_check.value_encrypted
+    ↓
+    SUCCESS → 更新 lock_state.json (failed_attempts = 0)
+              在内存中保留 master_key (Zeroizing 类型)
+              返回 VaultMetadata
+    ↓
+    FAILURE → failed_attempts++
+              计算延迟: min(2^failed_attempts, 300) 秒
+              更新 lock_state.json
+              返回 WrongPassword 错误
+```
+
+### 9.2 保存密码流程
+
+```rust
+Flutter UI → VaultService.create_entry(EntryInput)
+    ↓
+Rust FFI: 生成新的 12 字节随机 nonce
+    ↓
+Rust: 检查 nonce 是否已存在（极低概率）
+    已存在 → 重新生成
+    ↓
+Rust: FOR EACH sensitive_field:
+        encrypted = AES-256-GCM(plaintext, master_key, nonce)
+    ↓
+storage::save_entry(EncryptedEntry { nonce, encrypted_fields... })
+    ↓
+创建数据库备份（覆盖最旧的备份，保留最多5个）
+```
+
+### 9.3 密钥轮换流程
+
+```
+用户请求修改主密码
+    ↓
+验证旧主密码（解锁验证）
+    ↓
+FOR EACH entry IN database:
+    1. 读取 entry.nonce, entry.*_encrypted
+    2. 用旧 master_key 解密
+    3. 生成新的 nonce
+    4. 用新 master_key 重新加密
+    5. 更新 entry
+    ↓
+重新加密 master_key_check
+    ↓
+可选：生成新的 kdf_salt
+    ↓
+备份数据库（轮换前，带标记 _pre_keychange）
+    ↓
+清除旧备份（7天前的所有备份）
+```
+
+---
+
+## 10. 安全设计
+
+### 10.1 加密方案
 
 | 数据 | 加密方式 | 说明 |
 |------|----------|------|
 | 主密码派生密钥 | Argon2id | mem: 256MB, time: 3, parallelism: 4 (可配置) |
 | 各字段内容 | AES-256-GCM | 每条目独立 nonce，AEAD 模式内置认证 |
 | 密钥文件 | 随机 32 字节 | 作为主密码派生的额外输入 |
-| Nonce 生成 | CSPRNG (getrandom) | 每条目 12 字节，唯一性由随机性保证 |
+| Nonce 生成 | CSPRNG (getrandom) | 每条目 12 字节，数据库 UNIQUE 约束保证唯一性 |
+| 密钥文件校验 | BLAKE3 | 无密钥哈希，用于完整性验证 |
 
-**AES-256-GCM 说明**：
-- GCM 模式是 AEAD（认证加密），内置数据完整性校验
-- 无需额外的 HMAC 层，认证标签（16字节）与密文一起存储
-- Nonce 必须 12 字节以达到最佳性能和安全性
-
-### 6.2 Argon2id 参数配置
+### 10.2 Argon2id 参数配置
 
 参数应根据用户硬件能力可配置（在设置中提供"安全级别"选项）：
 
@@ -331,22 +537,31 @@ FOR EACH entry:
 | 中（默认） | 256MB | 3 | 4 | ~500ms | 标准设备 |
 | 高 | 1GB | 5 | 8 | ~2s | 高性能设备 |
 
-Salt 生成与存储：
-- 创建保险库时生成 32 字节随机 salt
-- Salt 以明文存储在 `vault_metadata` 表中
-- 修改主密码时可选择重新生成 salt
-
-### 6.3 暴力破解防护
+### 10.3 暴力破解防护
 
 | 机制 | 实现方式 | 存储位置 |
 |------|----------|----------|
-| 失败计数 | 每次失败 `failed_attempts++` | `security_state` 表 |
-| 指数退避 | 2^n 秒延迟，n=失败次数 | 内存计算 |
-| 强制锁定 | 5次失败后锁定30秒 | `security_state.lock_until` |
+| 失败计数 | 每次失败 `failed_attempts++` | `security/lock_state.json` |
+| 指数退避 | `min(2^n, 300)` 秒延迟 | 内存计算 + JSON 存储 |
+| 强制锁定 | 5次失败后锁定，每次失败增加延迟 | `lock_state.lock_until` |
 
-**说明**：`security_state` 表存储在加密数据库内，攻击者无法直接修改计数器。即使删除数据库文件，攻击者仍然需要破解加密。
+**防护逻辑**：
+```rust
+let delay_secs = (1 << failed_attempts.min(8)).min(300); // max 5分钟
+lock_until = current_time + delay_secs;
+```
 
-### 6.4 安全措施
+### 10.4 备份策略
+
+| 策略 | 说明 |
+|------|------|
+| 备份频率 | 每次修改操作后 |
+| 保留数量 | 最多 5 个滚动备份 |
+| 命名格式 | `vault_YYYYMMDD_HHMMSS.db` |
+| 旧备份清理 | 7 天后自动删除 |
+| 密钥轮换 | 轮换前标记 `_pre_keychange`，轮换后清除旧备份 |
+
+### 10.5 安全措施
 
 | 措施 | 实现方式 |
 |------|----------|
@@ -355,10 +570,105 @@ Salt 生成与存储：
 | 防剪贴板泄露 | 复制后 30 秒自动清除 |
 | 防截屏录屏 | macOS: `NSWindowSharingNone`, Windows: `SetWindowDisplayAffinity` |
 | 自动锁定 | 无操作 5 分钟后清除内存中的 master_key |
-| 数据库备份 | 每次修改后在同目录创建 `.bak` 文件 |
-| 安全退出 | 应用退出时清除所有敏感数据 |
+| 防重放攻击 | Nonce 数据库 UNIQUE 约束 |
 
-### 6.5 错误处理
+---
+
+## 11. 并发访问与崩溃恢复
+
+### 11.1 SQLite 并发配置
+
+```rust
+// SQLite 连接配置
+fn open_database(path: &Path) -> Result<Connection, PassKeepError> {
+    let conn = Connection::open(path)?;
+
+    // 启用 WAL 模式（更好的并发性）
+    conn.execute("PRAGMA journal_mode=WAL", [])?;
+
+    // 设置 busy_timeout（等待锁的最长时间）
+    conn.execute("PRAGMA busy_timeout=5000", [])?; // 5秒
+
+    // 单写者模式（密码管理器通常是单用户）
+    conn.execute("PRAGMA locking_mode=NORMAL", [])?;
+
+    Ok(conn)
+}
+```
+
+### 11.2 崩溃恢复
+
+| 场景 | 恢复机制 |
+|------|----------|
+| 写入过程中崩溃 | SQLite WAL 自动回滚未完成的事务 |
+| 数据库损坏 | 检测损坏后提示用户从备份恢复 |
+| 密钥文件损坏 | 提示用户从备份恢复（如有） |
+| 应用崩溃重启 | 内存状态丢失，需要重新解锁（符合预期） |
+
+### 11.3 事务一致性
+
+```rust
+// 所有修改操作在事务中执行
+conn.transaction(|tx| {
+    // 1. 执行修改
+    tx.execute(...)?;
+
+    // 2. 更新时间戳
+    tx.execute(...)?;
+
+    // 3. 创建备份
+    create_backup(tx)?;
+
+    Ok(())
+})?;
+```
+
+---
+
+## 12. 导入/导出格式
+
+### 12.1 加密导出格式 (JSON)
+
+```json
+{
+  "format": "passkeep-export",
+  "version": 1,
+  "exported_at": 1712188800,
+  "kdf_params": {
+    "salt": "base64...",
+    "mem_cost_kib": 262144,
+    "time_cost": 3,
+    "parallelism": 4
+  },
+  "entries": [
+    {
+      "id": "uuid",
+      "title": "明文标题",
+      "username_encrypted": "base64...",
+      "password_encrypted": "base64...",
+      "url_encrypted": "base64...",
+      "notes_encrypted": "base64...",
+      "nonce": "base64...",
+      "folder_id": "uuid",
+      "tags": ["tag1", "tag2"]
+    }
+  ],
+  "folders": [
+    {
+      "id": "uuid",
+      "name": "文件夹名",
+      "icon": "folder",
+      "parent_id": null
+    }
+  ]
+}
+```
+
+**说明**：导出文件中的 `*_encrypted` 字段仍然是加密的，需要使用主密钥才能解密。导出文件可以用任何方式传输，即使被泄露也无法直接读取。
+
+---
+
+## 13. 错误处理
 
 ```rust
 pub enum PassKeepError {
@@ -366,12 +676,15 @@ pub enum PassKeepError {
     WrongPassword,
     KeyFileNotFound,
     KeyFileInvalid,
+    KeyFileCorrupted,
+    KeyFileVersionMismatch,
     VaultLocked(i64),  // 参数：解锁时间戳
 
     // 加密相关
     EncryptionFailed,
     DecryptionFailed,
     InvalidNonce,
+    NonceReuseAttempt, // 尝试重用 nonce
 
     // 存储相关
     DatabaseLocked,
@@ -388,7 +701,7 @@ pub enum PassKeepError {
 
 ---
 
-## 7. 性能指标
+## 14. 性能指标
 
 | 指标 | 目标 | 测量方式 |
 |------|------|----------|
@@ -401,7 +714,7 @@ pub enum PassKeepError {
 
 ---
 
-## 8. 项目结构
+## 15. 项目结构
 
 ```
 passkeep/
@@ -475,14 +788,15 @@ passkeep/
 
 ---
 
-## 9. 技术依赖
+## 16. 技术依赖
 
-### 9.1 Rust 依赖
+### 16.1 Rust 依赖
 
 | 依赖 | 版本 | 用途 |
 |------|------|------|
 | `aes-gcm` | ^0.10 | AES-256-GCM 加密 |
 | `argon2` | ^0.5 | 密钥派生 |
+| `blake3` | ^1.5 | 密钥文件校验和 |
 | `rusqlite` | ^0.30 | SQLite 数据库 |
 | `zeroize` | ^1.6 | 安全内存清理 |
 | `serde` | ^1.0 | 序列化 |
@@ -490,7 +804,7 @@ passkeep/
 | `getrandom` | ^0.2 | 随机数生成 |
 | `flutter_rust_bridge` | ^2.0 | FFI 代码生成 |
 
-### 9.2 Flutter 依赖
+### 16.2 Flutter 依赖
 
 | 依赖 | 版本 | 用途 |
 |------|------|------|
@@ -501,9 +815,9 @@ passkeep/
 
 ---
 
-## 10. 测试策略
+## 17. 测试策略
 
-### 10.1 测试覆盖率目标
+### 17.1 测试覆盖率目标
 
 | 层级 | 测试类型 | 覆盖目标 | 工具 |
 |------|----------|----------|------|
@@ -514,28 +828,30 @@ passkeep/
 | Flutter App | Widget 测试 | 主要页面 | flutter test |
 | Flutter App | 集成测试 | 完整流程 | integration_test |
 
-### 10.2 关键测试场景
+### 17.2 关键测试场景
 
 - **加密往返**：明文 → 加密 → 解密 → 明文，验证一致性
 - **密钥派生**：相同输入产生相同密钥，不同输入产生不同密钥
 - **数据库锁定/解锁**：验证 master_key 清除后的锁定状态
+- **nonce 唯一性**：尝试重用 nonce 应返回错误
 - **导入/导出**：导出后导入，验证数据完整性
 - **FFI 内存**：长时间运行无内存泄漏
 - **并发访问**：多个操作同时执行的数据一致性
 
-### 10.3 模糊测试目标
+### 17.3 模糊测试目标
 
 | 目标 | 输入范围 | 预期行为 |
 |------|----------|----------|
 | 加密函数 | 任意长度字节串 | 绝不崩溃，返回错误或有效密文 |
 | KDF 函数 | 任意密码长度 | 绝不崩溃，执行时间合理 |
 | 数据库解析 | 损坏的 SQLite 文件 | 返回 DatabaseCorrupted 错误 |
+| 密钥文件解析 | 任意字节文件 | 返回 KeyFileInvalid 错误 |
 
 ---
 
-## 11. CI/CD 与安全审计
+## 18. CI/CD 与安全审计
 
-### 11.1 CI 流水线
+### 18.1 CI 流水线
 
 ```yaml
 # .github/workflows/ci.yml
@@ -555,7 +871,7 @@ jobs:
     - flutter pub run dependency_validator
 ```
 
-### 11.2 安全审计
+### 18.2 安全审计
 
 | 工具 | 频率 | 作用 |
 |------|------|------|
@@ -564,7 +880,7 @@ jobs:
 | `flutter pub dependency_validator` | 每次 CI | Flutter 依赖检查 |
 | 手动代码审查 | 每个 PR | 安全敏感代码双人审查 |
 
-### 11.3 发布前检查清单
+### 18.3 发布前检查清单
 
 - [ ] 所有测试通过
 - [ ] 无依赖漏洞
@@ -575,16 +891,16 @@ jobs:
 
 ---
 
-## 12. 国际化与无障碍
+## 19. 国际化与无障碍
 
-### 12.1 国际化 (i18n)
+### 19.1 国际化 (i18n)
 
 - 使用 Flutter 内置 `flutter_localizations`
 - 首批支持：简体中文、英文
 - 所有用户可见字符串通过 `AppLocalizations` 访问
 - 日期/时间格式本地化
 
-### 12.2 无障碍 (a11y)
+### 19.2 无障碍 (a11y)
 
 - 所有交互元素添加 `Semantics` 标签
 - 支持键盘导航
@@ -594,7 +910,7 @@ jobs:
 
 ---
 
-## 13. 用户体验
+## 20. 用户体验
 
 | 场景 | 处理方式 |
 |------|----------|
@@ -607,24 +923,14 @@ jobs:
 
 ---
 
-## 14. 数据同步
+## 21. 版本管理与迁移
 
-由于采用离线优先设计，多设备间同步采用**手动导入/导出**方式：
-- 用户可将数据导出为加密的 JSON 文件
-- 通过 U 盘、网盘等方式传输到其他设备
-- 在目标设备上导入该文件
-- 导入时验证文件完整性和格式版本
-
----
-
-## 15. 版本管理与迁移
-
-### 15.1 数据库版本
+### 21.1 数据库版本
 
 - `vault_metadata.version` 存储当前数据库格式版本
 - 启动时检查版本，必要时执行迁移
 
-### 15.2 迁移策略
+### 21.2 迁移策略
 
 - 每次数据库结构变更更新版本号
 - 提供向前迁移脚本
@@ -633,7 +939,7 @@ jobs:
 
 ---
 
-## 16. 未来扩展方向
+## 22. 未来扩展方向
 
 1. **浏览器扩展** - WebSocket 本地通信，自动填充网页表单
 2. **移动端** - 共享 Rust 核心库，Flutter 原生支持

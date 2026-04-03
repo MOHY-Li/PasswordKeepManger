@@ -1,5 +1,6 @@
 //! Cryptographic operations for encryption and key derivation
 
+pub mod aes;
 pub mod argon2;
 pub mod encryption;
 pub mod hkdf;

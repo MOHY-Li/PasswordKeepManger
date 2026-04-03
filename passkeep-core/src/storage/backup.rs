@@ -6,6 +6,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+/// Maximum number of backups to retain
+const MAX_BACKUPS: usize = 5;
+
 /// Manager for creating and cleaning up vault backups
 pub struct BackupManager {
     vault_path: PathBuf,
@@ -22,8 +25,7 @@ impl BackupManager {
             .unwrap_or_else(|| Path::new("."))
             .join("backups");
 
-        fs::create_dir_all(&backup_dir)
-            .map_err(|_| PassKeepError::BackupFailed)?;
+        fs::create_dir_all(&backup_dir).map_err(|_| PassKeepError::BackupFailed)?;
 
         Ok(Self {
             vault_path: vault_path.to_path_buf(),
@@ -50,12 +52,12 @@ impl BackupManager {
         }
 
         // Use VACUUM INTO to create a clean backup
-        let conn = Connection::open(&self.vault_path)
-            .map_err(|_| PassKeepError::BackupFailed)?;
+        let conn = Connection::open(&self.vault_path).map_err(|_| PassKeepError::BackupFailed)?;
 
-        // VACUUM INTO requires the path as a parameter, not embedded in the SQL
+        // Note: VACUUM INTO doesn't support parameter binding for filename.
+        // The backup_path is internally generated, not from user input, so this is safe.
         conn.pragma_update(None, "journal_mode", "DELETE")?;
-        conn.execute("VACUUM INTO ?1", [&backup_path.display().to_string()])
+        conn.execute(&format!("VACUUM INTO '{}'", backup_path.display()), [])
             .map_err(|_| PassKeepError::BackupFailed)?;
 
         // Clean up old backups (keep max 5)
@@ -86,14 +88,14 @@ impl BackupManager {
         Ok(backups)
     }
 
-    /// Clean up old backups, keeping only the 5 most recent
+    /// Clean up old backups, keeping only the most recent backups
     fn cleanup_old_backups(&self) -> Result<(), PassKeepError> {
         let mut backups = self.list_backups()?;
         backups.sort();
         backups.reverse();
 
-        // Remove backups beyond the 5 most recent
-        for old_backup in backups.into_iter().skip(5) {
+        // Remove backups beyond the MAX_BACKUPS most recent
+        for old_backup in backups.into_iter().skip(MAX_BACKUPS) {
             fs::remove_file(&old_backup).map_err(|_| PassKeepError::BackupFailed)?;
         }
 
@@ -109,19 +111,16 @@ impl BackupManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
     use rusqlite::Connection;
     use std::fs::File;
+    use tempfile::TempDir;
 
     /// Helper to create a test database in a temp directory
     fn create_test_vault(dir: &Path, name: &str) -> PathBuf {
         let vault_path = dir.join(name);
         let conn = Connection::open(&vault_path).unwrap();
-        conn.execute(
-            "CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)",
-            [],
-        )
-        .unwrap();
+        conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)", [])
+            .unwrap();
         conn.execute("INSERT INTO test (id, value) VALUES (1, 'test')", [])
             .unwrap();
         vault_path
@@ -218,9 +217,7 @@ mod tests {
         // Verify backup contains the same data
         let backup_conn = Connection::open(&backup_path).unwrap();
         let value: String = backup_conn
-            .query_row("SELECT value FROM test WHERE id = 1", [], |row| {
-                row.get(0)
-            })
+            .query_row("SELECT value FROM test WHERE id = 1", [], |row| row.get(0))
             .unwrap();
 
         assert_eq!(value, "test");

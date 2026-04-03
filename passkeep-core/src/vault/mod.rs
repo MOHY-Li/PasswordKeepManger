@@ -11,6 +11,8 @@ use zeroize::Zeroize;
 
 pub mod unlock;
 
+pub use unlock::unlock_vault;
+
 /// Opaque handle type for vault sessions
 pub type VaultHandle = u64;
 

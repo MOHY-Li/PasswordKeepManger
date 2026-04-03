@@ -1,7 +1,8 @@
 //! Database operations
 
-use crate::models::VaultMetadata;
+use crate::models::{KdfParams, VaultMetadata};
 use crate::storage::error::PassKeepError;
+use crate::storage::lock_state::LockState;
 use rusqlite::{Connection, Result as SqliteResult};
 use std::path::Path;
 
@@ -91,6 +92,65 @@ impl Database {
             Err(rusqlite::Error::SqliteFailure(err, _)) if err.code == rusqlite::ErrorCode::DatabaseBusy => Ok(true),
             Err(_) => Ok(false),
         }
+    }
+
+    /// Get the current lock state from the database
+    pub fn get_lock_state(&self) -> Result<LockState, PassKeepError> {
+        self.conn
+            .query_row(
+                "SELECT failed_attempts, lock_until, last_attempt_at FROM vault_metadata WHERE id = 1",
+                [],
+                |row| {
+                    Ok(LockState {
+                        failed_attempts: row.get(0)?,
+                        lock_until: row.get(1)?,
+                        // Use current time if last_attempt_at is NULL
+                        last_attempt_at: match row.get::<_, Option<i64>>(2)? {
+                            Some(t) => t,
+                            None => {
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_secs() as i64
+                            }
+                        },
+                    })
+                },
+            )
+            .map_err(|_| PassKeepError::DatabaseCorrupted)
+    }
+
+    /// Save the lock state to the database
+    pub fn save_lock_state(&self, state: &LockState) -> Result<(), PassKeepError> {
+        self.conn
+            .execute(
+                "UPDATE vault_metadata SET failed_attempts = ?1, lock_until = ?2, last_attempt_at = ?3 WHERE id = 1",
+                (state.failed_attempts, state.lock_until, state.last_attempt_at),
+            )
+            .map_err(|_| PassKeepError::LockStateUpdateFailed)?;
+        Ok(())
+    }
+
+    /// Get KDF parameters from vault metadata
+    pub fn get_kdf_params(&self) -> Result<KdfParams, PassKeepError> {
+        self.conn
+            .query_row(
+                "SELECT kdf_salt, kdf_mem_cost, kdf_time_cost, kdf_parallelism FROM vault_metadata WHERE id = 1",
+                [],
+                |row| {
+                    let salt_bytes: Vec<u8> = row.get(0)?;
+                    let mut salt = [0u8; 32];
+                    salt.copy_from_slice(&salt_bytes[..salt_bytes.len().min(32)]);
+
+                    Ok(KdfParams {
+                        salt,
+                        mem_cost_kib: row.get(1)?,
+                        time_cost: row.get(2)?,
+                        parallelism: row.get(3)?,
+                    })
+                },
+            )
+            .map_err(|_| PassKeepError::DatabaseCorrupted)
     }
 }
 

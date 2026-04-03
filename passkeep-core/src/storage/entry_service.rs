@@ -10,6 +10,7 @@ use rusqlite::Connection;
 use std::sync::{Arc, Mutex};
 
 /// Service for managing password entries with encryption
+#[allow(dead_code)]
 pub struct EntryService {
     db: Arc<Mutex<Connection>>,
     master_key: MasterKey,
@@ -33,6 +34,7 @@ impl EntryService {
     /// # Returns
     /// The ID of the created entry
     pub fn create(&self, input: &EntryInput) -> Result<String, PassKeepError> {
+        // TODO: Persist encrypted data to SQLite database
         let id = input
             .id
             .clone()

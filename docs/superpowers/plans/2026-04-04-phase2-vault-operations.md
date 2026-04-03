@@ -114,18 +114,37 @@ impl VaultManager {
 #[derive(ZeroizeOnDrop)]
 pub struct VaultSession {
     master_key: MasterKey,
+    db: VaultDb,
     config_path: PathBuf,
     keyfile_path: PathBuf,
+}
+
+// VaultDb 定义（需要在 VaultSession 之前）
+#[derive(Clone)]
+pub struct VaultDb {
+    pub conn: Arc<Mutex<rusqlite::Connection>>,
+}
+
+impl VaultDb {
+    pub fn new(conn: Arc<Mutex<rusqlite::Connection>>) -> Self {
+        // 启用 WAL 模式
+        let conn_guard = conn.lock().unwrap();
+        conn_guard.execute("PRAGMA journal_mode=WAL", []).ok();
+        drop(conn_guard);
+        Self { conn }
+    }
 }
 
 impl VaultSession {
     pub fn new(
         master_key: MasterKey,
+        db: VaultDb,
         config_path: PathBuf,
         keyfile_path: PathBuf,
     ) -> Self {
         Self {
             master_key,
+            db,
             config_path,
             keyfile_path,
         }
@@ -649,24 +668,19 @@ Run: `cargo test`
 
 use crate::storage::error::PassKeepError;
 use crate::models::{Entry, EntryInput, EntryMetadata};
-use crate::crypto::aes;
-use crate::crypto::rng;
+use crate::crypto::{aes, rng, MasterKey};
 use rusqlite::Connection;
 use std::sync::Arc;
 use std::sync::Mutex;
-use zeroize::Zeroizing;
 
 pub struct EntryService {
     db: Arc<Mutex<Connection>>,
-    master_key: Zeroizing<[u8; 32]>,
+    master_key: MasterKey,
 }
 
 impl EntryService {
-    pub fn new(db: Arc<Mutex<Connection>>, master_key: &Zeroizing<[u8; 32]>) -> Self {
-        Self {
-            db,
-            master_key: Zeroizing::new(*master_key.as_ref()),
-        }
+    pub fn new(db: Arc<Mutex<Connection>>, master_key: MasterKey) -> Self {
+        Self { db, master_key }
     }
 
     pub fn create(&self, input: &EntryInput) -> Result<String, PassKeepError> {
@@ -680,7 +694,7 @@ impl EntryService {
         let password_nonce = rng::generate_nonce();
         let password_encrypted = aes::encrypt_with_nonce(
             input.password.as_bytes(),
-            &self.master_key,
+            self.master_key.as_bytes(),
             &password_nonce,
             b"",
         )?;
@@ -688,14 +702,14 @@ impl EntryService {
         let url_nonce = input.url.as_ref().map(|_| rng::generate_nonce());
         let url_encrypted = input.url.as_ref().and_then(|url| {
             url_nonce.as_ref().map(|nonce| {
-                aes::encrypt_with_nonce(url.as_bytes(), &self.master_key, nonce, b"")
+                aes::encrypt_with_nonce(url.as_bytes(), self.master_key.as_bytes(), nonce, b"")
             })
         }).transpose()?;
 
         let notes_nonce = input.notes.as_ref().map(|_| rng::generate_nonce());
         let notes_encrypted = input.notes.as_ref().and_then(|notes| {
             notes_nonce.as_ref().map(|nonce| {
-                aes::encrypt_with_nonce(notes.as_bytes(), &self.master_key, nonce, b"")
+                aes::encrypt_with_nonce(notes.as_bytes(), self.master_key.as_bytes(), nonce, b"")
             })
         }).transpose()?;
 

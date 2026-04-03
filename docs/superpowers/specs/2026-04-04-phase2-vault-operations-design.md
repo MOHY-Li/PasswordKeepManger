@@ -92,12 +92,17 @@ pub struct VaultSession {
 }
 
 /// 数据库句柄
+#[derive(Clone)]
 pub struct VaultDb {
     pub conn: Arc<Mutex<rusqlite::Connection>>,
 }
 
 impl VaultDb {
     pub fn new(conn: Arc<Mutex<rusqlite::Connection>>) -> Self {
+        // 启用 WAL 模式以支持更好的并发性能
+        let conn_guard = conn.lock().unwrap();
+        conn_guard.execute("PRAGMA journal_mode=WAL", []).ok();
+        drop(conn_guard);
         Self { conn }
     }
 }
@@ -363,7 +368,7 @@ impl EntryService {
 use zeroize::Zeroize;
 
 /// 主密钥类型（32 字节，自动清零）
-#[derive(Zeroize)]
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct MasterKey(pub [u8; 32]);
 
 // 为方便使用，实现一些方法
@@ -483,6 +488,21 @@ pub enum ErrorCode {
 | `passkeep_close_vault` | 关闭保险库（释放句柄） |
 | `passkeep_get_last_error` | 获取最后的错误消息（返回 *const c_char） |
 
+**内存管理说明**：
+- `passkeep_get_last_error()` 返回指向线程局部存储中错误消息的 `*const c_char` 指针
+- **调用方必须复制字符串内容**：指针在下一次 FFI 调用时失效
+- 推荐调用方立即使用 `strncpy()` 或类似函数复制内容
+- **不要 free() 返回的指针**：内存由 Rust 管理
+- 典型用法模式：
+  ```c
+  const char* err = passkeep_get_last_error();
+  if (err) {
+      // 立即复制到自己的缓冲区
+      strncpy(my_buffer, err, sizeof(my_buffer) - 1);
+      // 不要调用 free(err)
+  }
+  ```
+
 ---
 
 ## 5. 解锁流程
@@ -490,7 +510,7 @@ pub enum ErrorCode {
 ```
 用户输入主密码 + 密钥文件路径
         ↓
-打开数据库连接
+打开数据库连接（启用 WAL 模式）
         ↓
 在同一事务中读取 vault_metadata（包括 LockState）
         ↓
@@ -578,10 +598,11 @@ fn backup_dir() -> PathBuf {
 impl VaultDb {
     pub fn new(conn: Arc<Mutex<rusqlite::Connection>>) -> Self {
         // 在连接初始化时启用 WAL 模式
-        let conn = conn.lock().unwrap();
-        conn.execute("PRAGMA journal_mode=WAL", []).ok();
-        drop(conn);
-        Self { conn }
+        let db = conn.clone();
+        let conn_guard = db.lock().unwrap();
+        conn_guard.execute("PRAGMA journal_mode=WAL", []).ok();
+        drop(conn_guard);
+        Self { conn: db }
     }
 }
 ```

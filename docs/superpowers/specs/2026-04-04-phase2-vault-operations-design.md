@@ -74,12 +74,9 @@ pub struct VaultManager {
     next_handle: AtomicU64,
     vaults: RwLock<HashMap<VaultHandle, Arc<Mutex<VaultSession>>>>,
 }
+// Send + Sync 自动由 RwLock、HashMap、AtomicU64 推导，无需手动实现
 
-// SAFETY: VaultManager 是线程安全的
-unsafe impl Send for VaultManager {}
-unsafe impl Sync for VaultManager {}
-
-/// 全局单例实例（使用 lazy_static）
+/// 全局单例实例（使用 lazy_static 或 once_cell）
 static GLOBAL_MANAGER: Lazy<Arc<VaultManager>> = Lazy::new(|| {
     Arc::new(VaultManager::new())
 });
@@ -221,8 +218,9 @@ UPDATE entries SET password_nonce = randomblob(12) WHERE password_nonce IS NULL;
 UPDATE entries SET url_nonce = randomblob(12) WHERE url_encrypted IS NOT NULL AND url_nonce IS NULL;
 UPDATE entries SET notes_nonce = randomblob(12) WHERE notes_encrypted IS NOT NULL AND notes_nonce IS NULL;
 
--- 设置 NOT NULL 约束（迁移后）
-ALTER TABLE entries ALTER COLUMN password_nonce SET NOT NULL;
+-- 注意：SQLite 不支持 ALTER COLUMN SET NOT NULL
+-- 新建条目时在应用层强制校验 nonce 不为空
+-- 或使用 CHECK 约束：ALTER TABLE entries ADD COLUMN password_nonce_check CHECK (password_nonce IS NOT NULL);
 
 -- 创建迁移记录
 INSERT INTO schema_migrations (version, applied_at)
@@ -232,7 +230,7 @@ VALUES (2, CAST(strftime('%s', 'now') AS INTEGER));
 **安全说明**：
 - 使用 `randomblob(12)` 生成加密安全的 nonce（SQLite 内置）
 - 全零 nonce 违反 AES-GCM 安全要求，必须使用随机值
-- 新建条目时必须提供 nonce，不允许默认值
+- 新建条目时必须提供 nonce，应用层强制校验
 
 ### 3.2 加密数据存储格式
 
@@ -270,18 +268,23 @@ VALUES (2, CAST(strftime('%s', 'now') AS INTEGER));
 impl VaultManager {
     pub fn new() -> Self;
     
-    // 利用 RwLock 内部可变性
+    // 利用 RwLock 内部可变性，所有方法使用 &self
     pub fn create_vault(&self, ...) -> Result<VaultHandle, PassKeepError>;
     pub fn unlock_vault(&self, ...) -> Result<VaultHandle, PassKeepError>;
     pub fn lock_vault(&self, handle: VaultHandle) -> Result<(), PassKeepError>;
     
-    // 获取会话的 Arc 克隆
+    // 获取会话的 Arc 克隆（用于后续操作）
     pub fn get_session(&self, handle: VaultHandle) -> Option<Arc<Mutex<VaultSession>>>;
     
     // 内部使用：在锁内执行操作
     fn with_session<F, R>(&self, handle: VaultHandle, f: F) -> Result<R, PassKeepError>
     where
         F: FnOnce(&VaultSession) -> Result<R, PassKeepError>;
+}
+
+// 全局访问器
+pub fn global_manager() -> Arc<VaultManager> {
+    GLOBAL_MANAGER.clone()
 }
 ```
 
@@ -336,6 +339,8 @@ impl EntryService {
     // 接收 VaultDb 和 MasterKey 引用
     pub fn new(db: VaultDb, master_key: &MasterKey) -> Self;
     
+    // 注意：使用 &self 但内部通过 Arc<Mutex<>> 修改数据库
+    // 这是 Rust 惯用的模式，对外不可变接口，内部可变性
     pub fn create(&self, input: &EntryInput) -> Result<String, PassKeepError>;
     pub fn get(&self, id: &str) -> Result<Entry, PassKeepError>;
     pub fn list(&self) -> Result<Vec<EntryMetadata>, PassKeepError>;
@@ -451,7 +456,7 @@ pub enum ErrorCode {
 | `passkeep_export_vault` | 导出保险库 |
 | `passkeep_import_vault` | 导入保险库 |
 | `passkeep_close_vault` | 关闭保险库（释放句柄） |
-| `passkeep_get_error_message` | 获取错误消息（传入错误码） |
+| `passkeep_get_last_error` | 获取最后的错误消息（返回 *const c_char） |
 
 ---
 
@@ -534,7 +539,9 @@ master_key = Argon2id(
 use dirs::data_dir;
 
 fn backup_dir() -> PathBuf {
-    let mut path = data_dir().unwrap();  // ~/Library/Application Support on macOS
+    let base = data_dir()
+        .unwrap_or_else(|| PathBuf::from("."));  // 容器环境降级到当前目录
+    let mut path = base;
     path.push("passkeep");
     path.push("backups");
     path
@@ -551,19 +558,26 @@ pub struct BackupManager {
 
 impl BackupManager {
     // 检查是否需要备份（同一秒内只备份一次）
+    // 使用 compare_exchange_weak 避免 TOCTOU 竞态
     fn should_backup(&self) -> bool {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
         
-        let last = self.last_backup_at.load(Ordering::Relaxed);
-        if now > last {
-            self.last_backup_at.store(now, Ordering::Relaxed);
-            true
-        } else {
-            false
+        let mut last = self.last_backup_at.load(Ordering::Acquire);
+        while now > last {
+            match self.last_backup_at.compare_exchange_weak(
+                last,
+                now,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,   // 成功更新时间戳
+                Err(actual) => last = actual,  // 其他线程已更新，重试
+            }
         }
+        false
     }
 }
 ```

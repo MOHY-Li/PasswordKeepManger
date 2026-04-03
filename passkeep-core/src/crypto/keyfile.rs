@@ -8,6 +8,7 @@
 
 use crate::storage::error::PassKeepError;
 use blake3::Hasher;
+use subtle::ConstantTimeEq;
 use std::fs;
 use std::path::Path;
 
@@ -32,6 +33,12 @@ pub struct KeyFile {
     pub secret: [u8; 32],
     /// BLAKE3 checksum of (secret || version)
     pub checksum: [u8; 32],
+}
+
+impl Default for KeyFile {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl KeyFile {
@@ -94,13 +101,13 @@ impl KeyFile {
         let secret: [u8; 32] = data[8..40].try_into().unwrap();
         let stored_checksum: [u8; 32] = data[40..72].try_into().unwrap();
 
-        // Verify checksum
+        // Verify checksum using constant-time comparison to prevent timing attacks
         let mut hasher = Hasher::new();
         hasher.update(&secret);
         hasher.update(&version.to_le_bytes());
         let computed_checksum = hasher.finalize();
 
-        if computed_checksum.as_bytes() != &stored_checksum {
+        if !bool::from(computed_checksum.as_bytes().ct_eq(&stored_checksum)) {
             return Err(PassKeepError::KeyFileCorrupted);
         }
 
@@ -181,7 +188,10 @@ mod tests {
         temp.write_all(&bytes).unwrap();
 
         let result = KeyFile::from_path(temp.path());
-        assert!(matches!(result, Err(PassKeepError::KeyFileVersionMismatch(9999))));
+        assert!(matches!(
+            result,
+            Err(PassKeepError::KeyFileVersionMismatch(9999))
+        ));
     }
 
     #[test]

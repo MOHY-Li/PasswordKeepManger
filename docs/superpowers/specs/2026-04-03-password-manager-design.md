@@ -1,7 +1,7 @@
 # PassKeep 密码管理器设计文档
 
 **日期**: 2026-04-03
-**状态**: 设计阶段 v5
+**状态**: 设计阶段 v6
 **作者**: Claude + 用户协作
 
 ---
@@ -47,7 +47,7 @@
 | 截屏/录屏 | 窗口防截屏属性 | OS 级别防护，Linux 有限 |
 | 暴力破解主密码 | Argon2id 高成本 KDF | 延迟攻击 |
 | 密钥文件被复制 | 主密码仍需输入 | 双因素认证 |
-| 数据库文件替换 | HMAC 完整性校验 | 检测篡改 |
+| 数据库文件替换 | AES-GCM 认证标签 | 检测篡改 |
 | 时间攻击 | 常量时间比较 | 密码验证 |
 | 侧信道攻击（缓存） | 使用常数时间密码原语 | 有限防护 |
 
@@ -316,6 +316,24 @@ pub enum ConflictResolution {
     /// 取消整个导入操作
     Abort,
 }
+
+// ============ 导入导出元数据 ============
+
+/// 导出文件的加密元数据（用于跨 vault 导入）
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ExportMetadata {
+    /// 格式标识
+    pub format: String,
+    /// 版本号
+    pub version: u32,
+    /// 导出时间戳
+    pub exported_at: i64,
+    /// 源 vault 的 KDF 参数（用于重新派生密钥）
+    pub kdf_params: KdfParams,
+    /// 加密的验证值（用于验证密码正确性）
+    pub verification_value_encrypted: Vec<u8>,
+    pub verification_nonce: Vec<u8>,
+}
 ```
 
 ---
@@ -355,37 +373,42 @@ pub enum ConflictResolution {
 
 ## 6. 主密钥派生
 
-### 6.1 派生公式（使用 HKDF-Extract）
+### 6.1 派生公式（使用 HKDF）
 
 ```rust
 use hkdf::Hkdf;
 use sha2::Sha256;
 
-// Step 1: 使用 HKDF-Extract 正确派生 Argon2id 的 salt
-// salt 参数 = 数据库中的 kdf_salt
-// ikm 参数 = 密钥文件内容
-let hkdf = Hkdf::<Sha256>::new(
-    Some(&kdf_salt),           // HKDF salt（来自数据库）
-    &keyfile_secret            // IKM（密钥文件内容）
-);
+// 正确的 hkdf crate API 使用
+// Step 1: 使用 HKDF-Extract 派生 Argon2id 的 salt
+let hkdf = Hkdf::<Sha256>::new(Some(&kdf_salt), &keyfile_secret);
 let mut argon_salt = [0u8; 32];
-hkdf.extract(&mut argon_salt); // 输出 32 字节
+hkdf.expand(b"passkeep-argon2-salt", &mut argon_salt)
+    .map_err(|_| PassKeepError::KeyDerivationFailed)?;
 
 // Step 2: 使用派生的 salt 调用 Argon2id
-master_key = Argon2id(
-    password = master_password,
-    salt = argon_salt,          // 32 字节 HKDF 输出
-    mem_cost = kdf_params.mem_cost_kib,
-    time_cost = kdf_params.time_cost,
-    parallelism = kdf_params.parallelism,
-    output_length = 32 bytes
-);
+let master_key = argon2::Argon2::new(
+    argon2::Algorithm::Argon2id,
+    argon2::Version::V0x13,
+    argon2::Params::new(
+        kdf_params.mem_cost_kib,  // 内存成本（KiB）
+        kdf_params.time_cost,     // 迭代次数
+        kdf_params.parallelism,   // 并行度
+        None
+    ).map_err(|_| PassKeepError::InvalidKdfParams)?
+)
+.hash_password_into(
+    master_password.as_bytes(),
+    &argon_salt,
+    &mut master_key_bytes,
+)
+.map_err(|_| PassKeepError::KeyDerivationFailed)?;
 ```
 
-**设计说明**：
-- HKDF-Extract 将密钥文件内容（IKM）与数据库盐值（salt）结合
-- 这样即使攻击者获取了数据库和密钥文件，仍然需要主密码
-- 密钥文件的作用是增加熵，防止纯主密码暴力破解
+**API 说明**：
+- `Hkdf::new(salt, ikm)` - 创建 HKDF 实例
+- `hkdf.expand(info, output)` - 输出派生密钥
+- `info` 参数用于绑定派生上下文，使用 `"passkeep-argon2-salt"` 确保密钥用途唯一
 
 ### 6.2 密钥文件验证流程
 
@@ -465,11 +488,21 @@ CREATE TABLE entries (
     FOREIGN KEY (folder_id) REFERENCES folders(id) ON DELETE SET NULL
 );
 
--- 自动更新 updated_at 触发器
+-- 自动设置 created_at 和 updated_at 触发器
+CREATE TRIGGER set_entries_timestamps
+AFTER INSERT ON entries
+BEGIN
+    UPDATE entries SET
+        created_at = CAST(strftime('%s', 'now') AS INTEGER),
+        updated_at = CAST(strftime('%s', 'now') AS INTEGER)
+    WHERE id = NEW.id;
+END;
+
 CREATE TRIGGER update_entries_timestamp
 AFTER UPDATE ON entries
 BEGIN
-    UPDATE entries SET updated_at = unixepoch() WHERE id = NEW.id;
+    UPDATE entries SET updated_at = CAST(strftime('%s', 'now') AS INTEGER)
+    WHERE id = NEW.id;
 END;
 
 -- 文件夹表
@@ -615,17 +648,29 @@ pub fn estimate_password_strength(password: String) -> f64
 
 ```rust
 /// 导出保险库到加密 JSON 文件
+/// 导出的文件可以被任何 vault 导入（跨 vault 导入需要源密码）
 #[frb(async)]
 pub async fn export_vault(
     output_path: String,
 ) -> Result<String, PassKeepError>
 
 /// 从加密 JSON 文件导入保险库
+///
+/// 如果导出文件来自另一个 vault（不同的 kdf_params），
+/// 需要用户提供源 vault 的主密码来解密。
+/// UI 应先读取文件的 metadata，如果 kdf_params 与当前不同，
+/// 则提示用户输入源 vault 的密码。
 #[frb(async)]
 pub async fn import_vault(
     input_path: String,
     options: ImportOptions,
+    source_password: Option<String>,  // None = 使用当前 master_key
 ) -> Result<ImportResult, PassKeepError>
+
+/// 读取导出文件的元数据（不进行解密）
+/// 用于在导入前显示文件信息并判断是否需要源密码
+#[frb(sync)]
+pub fn read_export_metadata(input_path: String) -> Result<ExportMetadata, PassKeepError>
 
 /// 导入结果统计
 #[derive(Serialize, Deserialize, Debug)]
@@ -657,7 +702,7 @@ Rust: 读取密钥文件，验证 BLAKE3 校验和
     ↓
 Rust: 从数据库读取 kdf_salt 和参数
     ↓
-Rust: argon_salt = HKDF-Extract(salt=kdf_salt, ikm=keyfile_secret)
+Rust: argon_salt = HKDF-Expand(salt=kdf_salt, ikm=keyfile_secret, info="passkeep-argon2-salt")
     ↓
 Rust: master_key = Argon2id(master_password, argon_salt, params) [异步]
     ↓
@@ -723,14 +768,53 @@ FOR EACH entry IN database:
 更新数据库 metadata
 ```
 
-### 9.4 导入流程
+### 9.4 导出流程
+
+```
+用户请求导出
+    ↓
+验证 vault 已解锁
+    ↓
+创建 ExportMetadata:
+    - 记录当前 vault 的 kdf_params
+    - 创建 verification_value_encrypted（用当前 master_key 加密已知值）
+    ↓
+FOR EACH entry IN database:
+    - password_encrypted 已经是加密状态，直接复制
+    - url_encrypted 已经是加密状态，直接复制
+    - notes_encrypted 已经是加密状态，直接复制
+    ↓
+序列化为 JSON（敏感字段保持加密状态）
+    ↓
+写入文件（.json.enc 扩展名）
+    ↓
+返回文件路径
+```
+
+**导出文件安全说明**：
+- 导出的 JSON 文件中，`password_encrypted`、`url_encrypted`、`notes_encrypted` 字段仍然是加密的
+- 要解密这些字段，需要使用源 vault 的 master_key
+- 源 vault 的 kdf_params 存储在导出文件的 `metadata` 中
+- 导出文件可以安全地通过任何方式传输，即使被泄露也无法直接读取
+
+### 9.5 导入流程
 
 ```
 用户选择导入文件
     ↓
-验证文件格式（magic、版本）
+调用 read_export_metadata() 读取文件元数据
     ↓
-使用当前 master_key 解密文件内容
+比较 metadata.kdf_params 与当前 vault 的 kdf_params
+    ↓
+    相同 → 使用当前 master_key 解密
+    不同 → 提示用户输入源 vault 的主密码
+            ↓
+            使用源密码 + 当前密钥文件 + metadata.kdf_params
+            派生出源 vault 的 master_key
+    ↓
+使用获得的 master_key 解密文件内容
+    ↓
+验证 verification_value_encrypted（如果验证失败，密码错误）
     ↓
 FOR EACH entry IN file:
     检查 ID 是否存在于数据库
@@ -746,6 +830,12 @@ FOR EACH entry IN file:
 返回 ImportResult（包含统计）
 ```
 
+**跨 vault 导入说明**：
+- 导入文件来自另一个 vault 时，kdf_params 会不同
+- UI 应提示用户输入源 vault 的主密码
+- 使用源密码派生出源 vault 的 master_key 来解密
+- 解密后的条目会使用当前 vault 的 master_key 重新加密存储
+
 ---
 
 ## 10. 安全设计
@@ -754,7 +844,7 @@ FOR EACH entry IN file:
 
 | 数据 | 加密方式 | 说明 |
 |------|----------|------|
-| 主密码派生密钥 | HKDF-Extract + Argon2id | HKDF 正确使用 salt |
+| 主密码派生密钥 | HKDF + Argon2id | HKDF 正确使用，info 参数绑定用途 |
 | 各字段内容 | AES-256-GCM | 每条目独立 nonce，AEAD 模式 |
 | 密钥文件 | 随机 32 字节 | 作为 HKDF IKM |
 | Nonce 生成 | CSPRNG (getrandom) | 每条目 12 字节，UNIQUE 约束 |
@@ -792,7 +882,7 @@ fn calculate_lockout_delay(failed_attempts: u32) -> u64 {
 | 字段 | 存储方式 | 理由 |
 |------|----------|------|
 | title | 明文 | 需要搜索，不是敏感信息 |
-| username | 明文 | 需要搜索/显示，通常不是敏感信息（邮箱/用户名） |
+| username | 明文 | 需要搜索/显示，通常不是敏感信息 |
 | password | 加密 | 核心敏感信息 |
 | url | 加密 | 可能包含敏感信息或会话 ID |
 | notes | 加密 | 可能包含敏感信息 |
@@ -865,14 +955,18 @@ fn open_database(path: &Path) -> Result<Connection, PassKeepError> {
 
 ```json
 {
-  "format": "passkeep-export",
-  "version": 1,
-  "exported_at": 1712188800,
-  "kdf_params": {
-    "salt": "base64...",
-    "mem_cost_kib": 262144,
-    "time_cost": 3,
-    "parallelism": 4
+  "metadata": {
+    "format": "passkeep-export",
+    "version": 1,
+    "exported_at": 1712188800,
+    "kdf_params": {
+      "salt": "base64...",
+      "mem_cost_kib": 262144,
+      "time_cost": 3,
+      "parallelism": 4
+    },
+    "verification_value_encrypted": "base64...",
+    "verification_nonce": "base64..."
   },
   "entries": [
     {
@@ -884,7 +978,9 @@ fn open_database(path: &Path) -> Result<Connection, PassKeepError> {
       "notes_encrypted": "base64...",
       "nonce": "base64...",
       "folder_id": "uuid",
-      "tags": ["tag1", "tag2"]
+      "tags": ["tag1", "tag2"],
+      "created_at": 1712188800,
+      "updated_at": 1712188800
     }
   ],
   "folders": [
@@ -892,27 +988,17 @@ fn open_database(path: &Path) -> Result<Connection, PassKeepError> {
       "id": "uuid",
       "name": "文件夹名",
       "icon": "folder",
-      "parent_id": null
+      "parent_id": null,
+      "created_at": 1712188800
     }
   ]
 }
 ```
 
-### 12.2 导出流程
-
-```
-用户请求导出
-    ↓
-验证 vault 已解锁
-    ↓
-使用当前 master_key 加密所有敏感字段
-    ↓
-序列化为 JSON
-    ↓
-写入文件（带时间戳）
-    ↓
-返回文件路径
-```
+**安全说明**：
+- 导出文件的 `*_encrypted` 字段使用源 vault 的 master_key 加密
+- 导入时需要源 vault 的主密码（或相同的 vault 配置）来解密
+- 元数据中的 `verification_value_encrypted` 用于验证密码正确性
 
 ---
 
@@ -949,6 +1035,9 @@ pub enum PassKeepError {
     #[error("Decryption failed")]
     DecryptionFailed,
 
+    #[error("Key derivation failed")]
+    KeyDerivationFailed,
+
     #[error("Invalid nonce")]
     InvalidNonce,
 
@@ -978,6 +1067,9 @@ pub enum PassKeepError {
     #[error("Import cancelled due to conflicts")]
     ImportCancelled,
 
+    #[error("Source vault password required")]
+    SourcePasswordRequired,
+
     // 系统相关
     #[error("Unauthorized access")]
     UnauthorizedAccess,
@@ -993,6 +1085,9 @@ pub enum PassKeepError {
 
     #[error("SQLite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
+
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
 }
 ```
 
@@ -1051,14 +1146,16 @@ passkeep/
 |------|------|------|
 | `aes-gcm` | ^0.10 | AES-256-GCM 加密 |
 | `argon2` | ^0.5 | 密钥派生 |
-| `hkdf` | ^0.12 | HKDF-Extract |
+| `hkdf` | ^0.12 | HKDF |
 | `sha2` | ^0.10 | HKDF 哈希函数 |
 | `blake3` | ^1.5 | 密钥文件校验和 |
 | `rusqlite` | ^0.30 | SQLite 数据库 |
 | `zeroize` | ^1.6 | 安全内存清理 |
 | `serde` | ^1.0 | 序列化 |
+| `serde_json` | ^1.0 | JSON 支持 |
 | `thiserror` | ^2.0 | 错误处理 |
 | `getrandom` | ^0.2 | 随机数生成 |
+| `uuid` | ^1.0 | UUID 生成 |
 | `flutter_rust_bridge` | ^2.0 | FFI 代码生成 |
 
 ### 16.2 Flutter 依赖
@@ -1067,7 +1164,7 @@ passkeep/
 |------|------|------|
 | `flutter_rust_bridge` | ^2.0 | FFI 代码生成 |
 | `riverpod` | ^2.4 | 状态管理 |
-| `super_clipboard` | ^0.8 | 剪贴板操作（跨平台） |
+| `super_clipboard` | ^0.8 | 剪贴板操作 |
 
 ---
 
@@ -1087,8 +1184,8 @@ passkeep/
 - **加密往返**：明文 → 加密 → 解密 → 明文
 - **密钥派生**：HKDF + Argon2id 正确性
 - **nonce 唯一性**：重用 nonce 应返回错误
-- **导入导出**：格式验证、冲突处理
-- **updated_at**：触发器自动更新
+- **导入导出**：格式验证、冲突处理、跨 vault 导入
+- **时间戳**：created_at 和 updated_at 自动设置
 
 ---
 
@@ -1122,6 +1219,7 @@ jobs:
 | 数据库损坏 | 自动检测备份文件，提示恢复 |
 | 密码强度提示 | 实时显示熵值 |
 | 导入冲突 | 让用户选择处理方式 |
+| 跨 vault 导入 | 提示输入源 vault 密码 |
 
 ---
 

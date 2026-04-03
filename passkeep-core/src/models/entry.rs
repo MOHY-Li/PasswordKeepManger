@@ -3,7 +3,7 @@
 //! TODO: This file belongs to Task 3 (Data Models Definition).
 //! It is included here as scaffolding/preview of upcoming work.
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 /// 条目输入（包含明文敏感数据）
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -61,7 +61,13 @@ mod tests {
     #[test]
     fn test_generate_url_preview() {
         assert_eq!(Entry::generate_url_preview(&None), "");
-        assert_eq!(Entry::generate_url_preview(&Some("https://example.com".to_string())), "https://example.com");
-        assert_eq!(Entry::generate_url_preview(&Some("a".repeat(100))), "a".repeat(50));
+        assert_eq!(
+            Entry::generate_url_preview(&Some("https://example.com".to_string())),
+            "https://example.com"
+        );
+        assert_eq!(
+            Entry::generate_url_preview(&Some("a".repeat(100))),
+            "a".repeat(50)
+        );
     }
 }

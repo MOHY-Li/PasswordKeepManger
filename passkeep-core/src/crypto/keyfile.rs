@@ -8,9 +8,9 @@
 
 use crate::storage::error::PassKeepError;
 use blake3::Hasher;
-use subtle::ConstantTimeEq;
 use std::fs;
 use std::path::Path;
+use subtle::ConstantTimeEq;
 
 /// Keyfile magic bytes for format identification
 pub const KEYFILE_MAGIC: &[u8; 4] = b"PKEY";

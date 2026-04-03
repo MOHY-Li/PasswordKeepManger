@@ -1,6 +1,6 @@
 //! Password generation models
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 /// 密码生成器配置
 #[derive(Serialize, Deserialize, Debug, Clone)]

@@ -50,6 +50,10 @@ impl Database {
     pub fn open(path: &Path) -> Result<Self, PassKeepError> {
         let conn = Connection::open(path)?;
         conn.execute("PRAGMA foreign_keys=ON", [])?;
+
+        // Apply any pending migrations
+        crate::storage::migrations::apply_v2_migration(&conn)?;
+
         Ok(Self { conn })
     }
 

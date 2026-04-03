@@ -1,7 +1,7 @@
 # PassKeep 密码管理器设计文档
 
 **日期**: 2026-04-03
-**状态**: 设计阶段 v7
+**状态**: 设计阶段 v8
 **作者**: Claude + 用户协作
 
 ---
@@ -377,14 +377,17 @@ pub struct ExportMetadata {
 ```rust
 use hkdf::Hkdf;
 use sha2::Sha256;
+use zeroize::Zeroizing;
 
 // hkdf crate 0.12 的正确 API
+// info 参数类型是 &[&[u8]]，不是 &[u8]
 let hkdf = Hkdf::<Sha256>::new(Some(&kdf_salt), &keyfile_secret);
 let mut argon_salt = [0u8; 32];
-hkdf.expand(b"passkeep-argon2-salt", &mut argon_salt)
+hkdf.expand(&[b"passkeep-argon2-salt"], &mut argon_salt)
     .map_err(|_| PassKeepError::KeyDerivationFailed)?;
 
 // Step 2: 使用派生的 salt 调用 Argon2id
+let mut master_key_bytes = Zeroizing::new([0u8; 32]);
 let master_key = argon2::Argon2::new(
     argon2::Algorithm::Argon2id,
     argon2::Version::V0x13,
@@ -398,15 +401,18 @@ let master_key = argon2::Argon2::new(
 .hash_password_into(
     master_password.as_bytes(),
     &argon_salt,
-    &mut master_key_bytes,
+    &mut **master_key_bytes,
 )
 .map_err(|_| PassKeepError::KeyDerivationFailed)?;
+
+// master_key_bytes 现在包含派生的主密钥
 ```
 
 **API 说明**：
-- `Hkdf::new(salt, ikm)` - 创建 HKDF 实例
+- `Hkdf::new(salt, ikm)` - 创建 HKDF 实例，salt 参数可选
 - `hkdf.expand(info, output)` - 输出派生密钥，返回 `Result<(), InvalidLength>`
-- `info` 参数绑定派生上下文，确保密钥用途唯一
+  - `info` 参数类型是 `&[&[u8]]`，用于绑定派生上下文
+  - 可以传递多个 info 片段，例如 `&[b"app-name", b"purpose"]`
 
 ### 6.2 密钥文件验证流程
 
@@ -731,15 +737,32 @@ Flutter UI → VaultService.create_entry(EntryInput)
     ↓
 read_export_metadata() 读取元数据
     ↓
-比较 kdf_params
+比较 kdf_params 与当前 vault
     ↓
-    相同 → source_keyfile_path = None
-    不同 → 需要 source_keyfile_path
+    相同 → source_keyfile_path = None，使用当前 master_key
+    不同 → 需要 source_keyfile_path 和 source_password
+            ↓
+            派生出源 vault 的 source_master_key
     ↓
-使用源密码（或当前密码）+ 源密钥文件派生 master_key
+使用 master_key（源或当前）解密文件内容
     ↓
-解密并导入
+验证 verification_value_encrypted
+    ↓
+FOR EACH entry IN file:
+    检查 ID 是否存在于当前数据库
+    ↓
+    存在 → 根据 ConflictResolution 处理
+    不存在 → 继续下一步
+    ↓
+    用当前 vault 的 master_key 重新加密敏感字段
+    生成新的 nonce
+    ↓
+    插入到当前数据库
+    ↓
+返回 ImportResult
 ```
+
+**重要**：跨 vault 导入时，所有条目必须用当前 vault 的 master_key 重新加密。源 vault 的 master_key 仅用于解密导出文件。
 
 ---
 
@@ -802,9 +825,141 @@ fn open_database(path: &Path) -> Result<Connection, PassKeepError> {
 | 数据库损坏 | 提示从备份恢复 |
 | 应用崩溃 | 需重新解锁 |
 
+### 11.3 并发保护
+
+**lock_state.json 并发控制**：
+
+由于多个应用实例可能同时运行，`lock_state.json` 需要并发保护：
+
+```rust
+use fslock::LockFile;
+
+fn update_lock_state(state: &LockState) -> Result<(), PassKeepError> {
+    let lock_path = config_dir.join("security").join("lock_state.json");
+    let lock_file = LockFile::open(&lock_path)
+        .map_err(|_| PassKeepError::LockStateUpdateFailed)?;
+
+    // 独占锁，防止其他实例同时修改
+    lock_file.lock().map_err(|_| PassKeepError::LockStateUpdateFailed)?;
+
+    // 读取-修改-写入
+    let current = read_lock_state(&lock_path)?;
+    let updated = apply_failed_attempt(&current);
+    write_lock_state(&lock_path, &updated)?;
+
+    lock_file.unlock().map_err(|_| PassKeepError::LockStateUpdateFailed)?;
+    Ok(())
+}
+```
+
+**说明**：
+- 使用文件锁确保 `lock_state.json` 的原子更新
+- 如果文件锁失败，视为锁定状态，拒绝操作
+- 单实例运行时锁操作是轻量级的
+
 ---
 
-## 12. 导入/导出格式
+## 12. 测试策略
+
+### 12.1 测试覆盖率目标
+
+| 层级 | 测试类型 | 覆盖目标 | 工具 |
+|------|----------|----------|------|
+| Rust Core | 单元测试 | 90%+ | cargo test |
+| Rust Core | 集成测试 | 关键流程 | cargo test |
+| Rust Core | 模糊测试 | 加密/解密 | libFuzzer |
+| Flutter App | 单元测试 | 80%+ | flutter test |
+| Flutter App | Widget 测试 | 主要页面 | flutter test |
+| Flutter App | 集成测试 | 完整流程 | integration_test |
+
+### 12.2 关键测试场景
+
+- **加密往返**：明文 → 加密 → 解密 → 明文，验证一致性
+- **密钥派生**：相同输入产生相同密钥，不同输入产生不同密钥
+- **HKDF 正确性**：验证 HKDF-Expand 输出符合预期
+- **nonce 唯一性**：尝试重用 nonce 应返回错误
+- **nonce 冲突处理**：模拟冲突后重新生成
+- **数据库锁定/解锁**：验证 master_key 清除后的锁定状态
+- **导入导出**：导出后导入验证数据完整性
+- **跨 vault 导入**：不同 kdf_params 的导入流程
+- **时间戳触发器**：验证 created_at/updated_at 自动设置
+- **FFI 内存**：长时间运行无内存泄漏
+- **并发访问**：多操作同时执行的数据一致性
+
+### 12.3 模糊测试目标
+
+| 目标 | 输入范围 | 预期行为 |
+|------|----------|----------|
+| 加密函数 | 任意长度字节串 | 绝不崩溃，返回错误或有效密文 |
+| KDF 函数 | 任意密码长度 | 绝不崩溃，执行时间合理 |
+| HKDF 函数 | 任意 salt/ikm 组合 | 绝不崩溃 |
+| 数据库解析 | 损坏的 SQLite 文件 | 返回 DatabaseCorrupted 错误 |
+| 密钥文件解析 | 任意字节文件 | 返回 KeyFileInvalid 错误 |
+| 导入文件解析 | 损坏的 JSON 文件 | 返回 InvalidExportFormat 错误 |
+
+---
+
+## 13. CI/CD 与安全审计
+
+### 13.1 CI 流水线
+
+```yaml
+# .github/workflows/ci.yml
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - run: cargo fmt --check
+      - run: cargo clippy -- -D warnings
+      - run: cargo test --all-features
+      - run: cargo audit
+
+  flutter:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+      - run: flutter analyze
+      - run: flutter test
+      - run: flutter test integration_test
+
+  fuzz:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - run: cargo install cargo-fuzz
+      - run: cargo fuzz run encrypt_target -- -max_total_time=60
+```
+
+### 13.2 安全审计
+
+| 工具 | 频率 | 作用 |
+|------|------|------|
+| `cargo audit` | 每次 CI | 检查 Rust 依赖漏洞 |
+| `cargo-deny` | 每周 | 许可证检查、依赖审计 |
+| `flutter pub dependency_validator` | 每次 CI | Flutter 依赖检查 |
+| 手动代码审查 | 每个 PR | 安全敏感代码双人审查 |
+
+### 13.3 发布前检查清单
+
+- [ ] 所有测试通过
+- [ ] 无依赖漏洞
+- [ ] FFI 边界测试通过
+- [ ] 内存泄漏检测
+- [ ] 性能基准测试达标
+- [ ] 跨平台测试
+
+---
+
+## 14. 导入/导出格式
 
 ### 12.1 导出格式 (JSON)
 
@@ -852,10 +1007,12 @@ PassKeepEncryptedFile {
 
 ---
 
-## 13. 错误处理
+## 15. 错误处理
 
 ```rust
 use thiserror::Error;
+use zeroize::Zeroizing;
+use serde::{Serialize, Deserialize};
 
 #[derive(Debug, Error)]
 pub enum PassKeepError {
@@ -941,7 +1098,7 @@ pub enum PassKeepError {
 
 ---
 
-## 14. 性能指标
+## 16. 性能指标
 
 | 指标 | 目标 |
 |------|------|
@@ -952,7 +1109,7 @@ pub enum PassKeepError {
 
 ---
 
-## 15. 技术依赖
+## 17. 技术依赖
 
 ### 15.1 Rust 依赖
 
@@ -969,6 +1126,7 @@ pub enum PassKeepError {
 | `serde_json` | ^1.0 | JSON |
 | `thiserror` | ^2.0 | 错误处理 |
 | `uuid` | ^1.0 | UUID |
+| `fslock` | ^0.2 | 文件锁（lock_state 并发保护） |
 | `flutter_rust_bridge` | ^2.0 | FFI |
 
 ### 15.2 Flutter 依赖
@@ -981,7 +1139,7 @@ pub enum PassKeepError {
 
 ---
 
-## 16. 用户体验
+## 18. 用户体验
 
 | 场景 | 处理方式 |
 |------|----------|
@@ -992,7 +1150,7 @@ pub enum PassKeepError {
 
 ---
 
-## 17. 未来扩展
+## 19. 未来扩展
 
 1. 浏览器扩展
 2. 移动端

@@ -75,26 +75,67 @@ pub struct VaultManager {
     vaults: RwLock<HashMap<VaultHandle, Arc<Mutex<VaultSession>>>>,
 }
 
+// SAFETY: VaultManager 是线程安全的
+unsafe impl Send for VaultManager {}
+unsafe impl Sync for VaultManager {}
+
+/// 全局单例实例（使用 lazy_static）
+static GLOBAL_MANAGER: Lazy<Arc<VaultManager>> = Lazy::new(|| {
+    Arc::new(VaultManager::new())
+});
+
 /// 单个保险库会话
 /// 注意：实现了 ZeroizeOnDrop，确保密钥在内存中被安全清除
 #[derive(ZeroizeOnDrop)]
 pub struct VaultSession {
     master_key: MasterKey,     // 自动 zeroize
+    db: VaultDb,                // 持有数据库连接
     config_path: PathBuf,
     keyfile_path: PathBuf,
 }
 
-/// 数据库句柄（与 VaultSession 分离，避免循环引用）
+/// 数据库句柄
 pub struct VaultDb {
-    conn: Arc<Mutex<Connection>>,
+    pub conn: Arc<Mutex<rusqlite::Connection>>,
+}
+
+impl VaultDb {
+    pub fn new(conn: Arc<Mutex<rusqlite::Connection>>) -> Self {
+        Self { conn }
+    }
 }
 ```
 
 **线程安全保证**：
-- `VaultManager` 使用 `RwLock` 保护内部状态
-- 支持 FFI 多线程调用（从不同 Dart isolate 调用）
-- `VaultSession` 的 `Database` 使用 `Arc<Mutex<>>` 包装
+- `VaultManager` 使用 `RwLock` 保护内部状态，实现 `Send + Sync`
+- 全局单例使用 `lazy_static` 初始化，FFI 可通过 `global_manager()` 访问
+- `VaultSession` 包装在 `Arc<Mutex<>>` 中，支持多线程访问
 - `master_key` 在 `VaultSession` drop 时自动清零
+
+**核心 API**:
+```rust
+impl VaultManager {
+    pub fn new() -> Self;
+    
+    // 利用 RwLock 内部可变性，&self 即可
+    pub fn create_vault(&self, ...) -> Result<VaultHandle, PassKeepError>;
+    pub fn unlock_vault(&self, ...) -> Result<VaultHandle, PassKeepError>;
+    pub fn lock_vault(&self, handle: VaultHandle) -> Result<(), PassKeepError>;
+    
+    // 获取会话的 Arc 克隆（支持跨线程传递）
+    pub fn get_session(&self, handle: VaultHandle) -> Option<Arc<Mutex<VaultSession>>>;
+    
+    // 内部使用：获取可变引用（需要写锁）
+    fn with_session_mut<F, R>(&self, handle: VaultHandle, f: F) -> Option<R>
+    where
+        F: FnOnce(&mut VaultSession) -> R;
+}
+
+// 全局访问器
+pub fn global_manager() -> Arc<VaultManager> {
+    GLOBAL_MANAGER.clone()
+}
+```
 
 ### 2.3 LockState 设计
 
@@ -164,7 +205,9 @@ impl LockState {
 
 ```sql
 -- 为每个敏感字段添加独立的 nonce（单独存储，不嵌入密文中）
-ALTER TABLE entries ADD COLUMN password_nonce BLOB NOT NULL DEFAULT X'000000000000000000000000';
+
+-- 新表的行直接添加 nonce 列（已有表需要迁移）
+ALTER TABLE entries ADD COLUMN password_nonce BLOB;  -- 不设置默认值
 ALTER TABLE entries ADD COLUMN url_nonce BLOB;
 ALTER TABLE entries ADD COLUMN notes_nonce BLOB;
 
@@ -173,10 +216,23 @@ ALTER TABLE vault_metadata ADD COLUMN failed_attempts INTEGER NOT NULL DEFAULT 0
 ALTER TABLE vault_metadata ADD COLUMN lock_until INTEGER;
 ALTER TABLE vault_metadata ADD COLUMN last_attempt_at INTEGER;
 
+-- 为现有条目生成随机 nonce（一次性迁移）
+UPDATE entries SET password_nonce = randomblob(12) WHERE password_nonce IS NULL;
+UPDATE entries SET url_nonce = randomblob(12) WHERE url_encrypted IS NOT NULL AND url_nonce IS NULL;
+UPDATE entries SET notes_nonce = randomblob(12) WHERE notes_encrypted IS NOT NULL AND notes_nonce IS NULL;
+
+-- 设置 NOT NULL 约束（迁移后）
+ALTER TABLE entries ALTER COLUMN password_nonce SET NOT NULL;
+
 -- 创建迁移记录
 INSERT INTO schema_migrations (version, applied_at)
 VALUES (2, CAST(strftime('%s', 'now') AS INTEGER));
 ```
+
+**安全说明**：
+- 使用 `randomblob(12)` 生成加密安全的 nonce（SQLite 内置）
+- 全零 nonce 违反 AES-GCM 安全要求，必须使用随机值
+- 新建条目时必须提供 nonce，不允许默认值
 
 ### 3.2 加密数据存储格式
 
@@ -214,16 +270,18 @@ VALUES (2, CAST(strftime('%s', 'now') AS INTEGER));
 impl VaultManager {
     pub fn new() -> Self;
     
-    // &self 而非 &mut self，利用 RwLock 的内部可变性
+    // 利用 RwLock 内部可变性
     pub fn create_vault(&self, ...) -> Result<VaultHandle, PassKeepError>;
     pub fn unlock_vault(&self, ...) -> Result<VaultHandle, PassKeepError>;
     pub fn lock_vault(&self, handle: VaultHandle) -> Result<(), PassKeepError>;
     
-    // 内部使用（需要 &mut self）
-    fn get_session_mut(&mut self, handle: VaultHandle) -> Option<&mut VaultSession>;
-    
-    // 公共 API（返回 Arc 包装的引用，支持跨线程）
+    // 获取会话的 Arc 克隆
     pub fn get_session(&self, handle: VaultHandle) -> Option<Arc<Mutex<VaultSession>>>;
+    
+    // 内部使用：在锁内执行操作
+    fn with_session<F, R>(&self, handle: VaultHandle, f: F) -> Result<R, PassKeepError>
+    where
+        F: FnOnce(&VaultSession) -> Result<R, PassKeepError>;
 }
 ```
 
@@ -275,8 +333,8 @@ impl LockState {
 **核心 API**:
 ```rust
 impl EntryService {
-    // 接收 Arc<Mutex<Connection>> 和 MasterKey 引用
-    pub fn new(db: Arc<Mutex<Connection>>, master_key: &MasterKey) -> Self;
+    // 接收 VaultDb 和 MasterKey 引用
+    pub fn new(db: VaultDb, master_key: &MasterKey) -> Self;
     
     pub fn create(&self, input: &EntryInput) -> Result<String, PassKeepError>;
     pub fn get(&self, id: &str) -> Result<Entry, PassKeepError>;
@@ -285,7 +343,7 @@ impl EntryService {
     pub fn update(&self, id: &str, input: &EntryInput) -> Result<(), PassKeepError>;
     pub fn delete(&self, id: &str) -> Result<(), PassKeepError>;
     
-    // 批量操作（避免多次触发备份）
+    // 批量操作：在单个事务中执行，原子性保证
     pub fn create_batch(&self, entries: &[EntryInput]) -> Result<Vec<String>, PassKeepError>;
 }
 ```
@@ -335,9 +393,11 @@ impl EntryService {
 ```
 
 **完整性验证**：
-- `integrity_hash`: 整个 JSON 文件的 BLAKE3 哈希值（排除此字段本身）
-- 导入时验证哈希，防止文件被篡改
-- `verification_value_encrypted`: 用于验证 master_key 正确性
+- `integrity_hash`: entries + folders 数组的 BLAKE3 哈希值（base64 编码）
+  - 计算方法：对 JSON 中的 `entries` 和 `folders` 字段序列化后计算 BLAKE3
+  - 导出时在写入 metadata 之前计算
+  - 导入时先验证哈希，再处理条目
+- `verification_value_encrypted`: 固定值 "PASSKEEP-VERIFICATION" 加密后的结果，用于验证 master_key 正确性
 
 **导入冲突策略**：
 | 策略 | 描述 |
@@ -355,8 +415,9 @@ impl EntryService {
 
 **错误处理设计**：
 - 每个函数返回错误码（`i32`），0 表示成功，非零表示错误类型
-- 错误消息存储在线程局部存储中，避免多线程覆盖
-- 调用方可用 `passkeep_get_error_message(code)` 获取详细错误信息
+- 最后的错误消息存储在线程局部存储中
+- `passkeep_get_last_error()` 返回指向错误消息的 `*const c_char` 指针
+- 调用方负责复制字符串（C 字符串生命周期到下一次 FFI 调用）
 
 **错误码定义**：
 ```rust
@@ -463,7 +524,7 @@ master_key = Argon2id(
 ### 6.2 备份管理详细设计
 
 **备份策略**：
-- **自动备份**：使用防抖机制，5 秒内的多次修改只触发一次备份
+- **自动备份**：每次修改操作后触发，但有限流（同一秒内最多备份一次）
 - **手动备份**：用户主动触发的完整备份（立即执行）
 - **保留数量**：最多保留 5 个最新备份
 - **命名规则**：`vault_<timestamp>.db`
@@ -477,6 +538,33 @@ fn backup_dir() -> PathBuf {
     path.push("passkeep");
     path.push("backups");
     path
+}
+```
+
+**防抖实现**：
+```rust
+use std::sync::atomic::{AtomicI64, Ordering};
+
+pub struct BackupManager {
+    last_backup_at: AtomicI64,  // Unix 时间戳
+}
+
+impl BackupManager {
+    // 检查是否需要备份（同一秒内只备份一次）
+    fn should_backup(&self) -> bool {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        
+        let last = self.last_backup_at.load(Ordering::Relaxed);
+        if now > last {
+            self.last_backup_at.store(now, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
 }
 ```
 
@@ -555,12 +643,13 @@ subtle = "2.6"
 fslock = "0.2.1"           # 文件锁（备份文件写入保护）
 dirs = "5.0"               # 跨平台路径获取
 
-# 异步支持（可选 feature）
+# 异步支持（可选 feature，Phase 3 预留）
 tokio = { version = "1.40", features = ["sync", "rt-multi-thread"], optional = true }
 
 [features]
 default = []
-async = ["tokio"]           # 启用异步支持（用于未来的 async FFI）
+async = ["tokio"]           # 启用异步支持（Phase 3：flutter_rust_bridge 异步 FFI）
+# Phase 2 不使用此 feature，保持依赖最小化
 
 [dev-dependencies]
 tempfile = "3.13"

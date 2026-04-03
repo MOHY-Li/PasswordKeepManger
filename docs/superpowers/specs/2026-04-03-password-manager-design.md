@@ -1,7 +1,7 @@
 # PassKeep 密码管理器设计文档
 
 **日期**: 2026-04-03
-**状态**: 设计阶段 v8
+**状态**: 设计阶段 v9
 **作者**: Claude + 用户协作
 
 ---
@@ -740,29 +740,31 @@ read_export_metadata() 读取元数据
 比较 kdf_params 与当前 vault
     ↓
     相同 → source_keyfile_path = None，使用当前 master_key
-    不同 → 需要 source_keyfile_path 和 source_password
-            ↓
-            派生出源 vault 的 source_master_key
     ↓
-使用 master_key（源或当前）解密文件内容
+    不同 → 判断密钥文件是否相同
+           ↓
+           密钥文件相同 → source_keyfile_path = None
+                        仅需 source_password
+                        用当前密钥文件 + 源密码派生源 master_key
+           ↓
+           密钥文件不同 → 需要 source_password + source_keyfile_path
+                         用源密钥文件 + 源密码派生源 master_key
+    ↓
+使用获得的 master_key 解密文件内容
     ↓
 验证 verification_value_encrypted
     ↓
-FOR EACH entry IN file:
-    检查 ID 是否存在于当前数据库
-    ↓
-    存在 → 根据 ConflictResolution 处理
-    不存在 → 继续下一步
-    ↓
+FOR EACH entry:
     用当前 vault 的 master_key 重新加密敏感字段
     生成新的 nonce
-    ↓
     插入到当前数据库
     ↓
 返回 ImportResult
 ```
 
-**重要**：跨 vault 导入时，所有条目必须用当前 vault 的 master_key 重新加密。源 vault 的 master_key 仅用于解密导出文件。
+**跨 vault 导入的密钥文件逻辑**：
+- 如果仅 kdf_params 不同但使用相同密钥文件：只需 `source_password`
+- 如果密钥文件也不同：需要 `source_password` + `source_keyfile_path`
 
 ---
 
@@ -927,7 +929,7 @@ jobs:
       - uses: subosito/flutter-action@v2
       - run: flutter analyze
       - run: flutter test
-      - run: flutter test integration_test
+      - run: flutter test integration_test/
 
   fuzz:
     runs-on: ubuntu-latest
@@ -961,7 +963,7 @@ jobs:
 
 ## 14. 导入/导出格式
 
-### 12.1 导出格式 (JSON)
+### 14.1 导出格式 (JSON)
 
 ```json
 {
@@ -993,7 +995,7 @@ jobs:
 }
 ```
 
-### 12.2 完全加密格式
+### 14.2 完全加密格式
 
 当 `encrypt_full_file = true` 时，整个 JSON 被加密为：
 
@@ -1011,7 +1013,6 @@ PassKeepEncryptedFile {
 
 ```rust
 use thiserror::Error;
-use zeroize::Zeroizing;
 use serde::{Serialize, Deserialize};
 
 #[derive(Debug, Error)]
@@ -1042,6 +1043,9 @@ pub enum PassKeepError {
 
     #[error("Key derivation failed")]
     KeyDerivationFailed,
+
+    #[error("Failed to update lock state file")]
+    LockStateUpdateFailed,
 
     #[error("Invalid nonce")]
     InvalidNonce,
@@ -1111,7 +1115,7 @@ pub enum PassKeepError {
 
 ## 17. 技术依赖
 
-### 15.1 Rust 依赖
+### 17.1 Rust 依赖
 
 | 依赖 | 版本 | 用途 |
 |------|------|------|
@@ -1129,7 +1133,7 @@ pub enum PassKeepError {
 | `fslock` | ^0.2 | 文件锁（lock_state 并发保护） |
 | `flutter_rust_bridge` | ^2.0 | FFI |
 
-### 15.2 Flutter 依赖
+### 17.2 Flutter 依赖
 
 | 依赖 | 版本 | 用途 |
 |------|------|------|

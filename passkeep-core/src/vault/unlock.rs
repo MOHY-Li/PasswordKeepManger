@@ -11,9 +11,7 @@ use crate::crypto::keyfile::KeyFile;
 use crate::models::KdfParams;
 use crate::storage::Database;
 use crate::storage::error::PassKeepError;
-use std::fs;
 use std::path::Path;
-use tempfile::TempDir;
 use zeroize::Zeroizing;
 
 /// Unlock the vault and return the master key
@@ -101,63 +99,67 @@ fn derive_master_key(
     Ok(master_key)
 }
 
-/// Helper to create a test vault with known parameters
-#[cfg(test)]
-fn setup_test_vault(temp_dir: &TempDir) -> (std::path::PathBuf, std::path::PathBuf, String) {
-    use crate::crypto::rng::generate_salt;
-    use crate::models::VaultMetadata;
-    use crate::storage::Database;
-
-    let config_path = temp_dir.path().join("test.db");
-    let keyfile_path = temp_dir.path().join("test.key");
-
-    // Create a test keyfile
-    let keyfile = KeyFile::new();
-    fs::write(&keyfile_path, keyfile.to_bytes()).unwrap();
-
-    // Create a test database
-    let db = Database::create(&config_path).unwrap();
-
-    // Set up vault metadata with test KDF parameters
-    let test_password = "test-password";
-    let test_salt = generate_salt();
-    let kdf_params = KdfParams {
-        salt: test_salt,
-        mem_cost_kib: 65536, // 64 MiB (reduced for tests)
-        time_cost: 2,
-        parallelism: 2,
-    };
-
-    let _metadata = VaultMetadata::new(kdf_params.clone());
-
-    // Insert initial vault_metadata row (id=1) with lock state initialized
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
-
-    db.conn
-        .execute(
-            "INSERT OR REPLACE INTO vault_metadata (id, version, kdf_salt, kdf_mem_cost, kdf_time_cost, kdf_parallelism, created_at, updated_at, failed_attempts, lock_until, last_attempt_at) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, NULL, ?8)",
-            (
-                1u32,
-                &kdf_params.salt[..],
-                kdf_params.mem_cost_kib,
-                kdf_params.time_cost,
-                kdf_params.parallelism,
-                now,
-                now,
-                now, // last_attempt_at
-            ),
-        )
-        .unwrap();
-
-    (config_path, keyfile_path, test_password.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// Test memory cost constant (64 MiB for faster tests)
+    const TEST_MEM_COST_KIB: u32 = 65536;
+
+    /// Helper to create a test vault with known parameters
+    fn setup_test_vault(temp_dir: &TempDir) -> (std::path::PathBuf, std::path::PathBuf, String) {
+        use crate::crypto::rng::generate_salt;
+        use crate::models::VaultMetadata;
+        use crate::storage::Database;
+
+        let config_path = temp_dir.path().join("test.db");
+        let keyfile_path = temp_dir.path().join("test.key");
+
+        // Create a test keyfile
+        let keyfile = KeyFile::new();
+        fs::write(&keyfile_path, keyfile.to_bytes()).unwrap();
+
+        // Create a test database
+        let db = Database::create(&config_path).unwrap();
+
+        // Set up vault metadata with test KDF parameters
+        let test_password = "test-password";
+        let test_salt = generate_salt();
+        let kdf_params = KdfParams {
+            salt: test_salt,
+            mem_cost_kib: TEST_MEM_COST_KIB,
+            time_cost: 2,
+            parallelism: 2,
+        };
+
+        let _metadata = VaultMetadata::new(kdf_params.clone());
+
+        // Insert initial vault_metadata row (id=1) with lock state initialized
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        db.conn
+            .execute(
+                "INSERT OR REPLACE INTO vault_metadata (id, version, kdf_salt, kdf_mem_cost, kdf_time_cost, kdf_parallelism, created_at, updated_at, failed_attempts, lock_until, last_attempt_at) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, NULL, ?8)",
+                (
+                    1u32,
+                    &kdf_params.salt[..],
+                    kdf_params.mem_cost_kib,
+                    kdf_params.time_cost,
+                    kdf_params.parallelism,
+                    now,
+                    now,
+                    now, // last_attempt_at
+                ),
+            )
+            .unwrap();
+
+        (config_path, keyfile_path, test_password.to_string())
+    }
 
     #[test]
     fn test_unlock_with_correct_password() {
@@ -288,7 +290,7 @@ mod tests {
         let db = Database::open(&config_path).unwrap();
 
         let kdf_params = db.get_kdf_params().unwrap();
-        assert_eq!(kdf_params.mem_cost_kib, 65536);
+        assert_eq!(kdf_params.mem_cost_kib, TEST_MEM_COST_KIB);
         assert_eq!(kdf_params.time_cost, 2);
         assert_eq!(kdf_params.parallelism, 2);
         assert!(!kdf_params.salt.iter().all(|&b| b == 0)); // Salt should be non-zero

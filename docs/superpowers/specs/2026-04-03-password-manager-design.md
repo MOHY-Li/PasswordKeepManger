@@ -1,7 +1,7 @@
 # PassKeep 密码管理器设计文档
 
 **日期**: 2026-04-03
-**状态**: 设计阶段 v3
+**状态**: 设计阶段 v4
 **作者**: Claude + 用户协作
 
 ---
@@ -44,7 +44,7 @@
 | 硬盘被盗/设备丢失 | 数据库文件加密 | 需要 master_key 解密 |
 | 内存转储攻击 | 敏感数据使用 `zeroize` | 进程退出时清理 |
 | 剪贴板窃取 | 30秒自动清除 | 限制泄露窗口 |
-| 截屏/录屏 | 窗口防截屏属性 | OS 级别防护 |
+| 截屏/录屏 | 窗口防截屏属性 | OS 级别防护，Linux 有限 |
 | 暴力破解主密码 | Argon2id 高成本 KDF | 延迟攻击 |
 | 密钥文件被复制 | 主密码仍需输入 | 双因素认证 |
 | 数据库文件替换 | HMAC 完整性校验 | 检测篡改 |
@@ -79,7 +79,7 @@
 │                              │                                      │
 │                         ┌────▼────┐                                 │
 │                         │ FFI Bridge│                                │
-│                         │ (dart:ffi)│                               │
+│                         │ (async)    │                               │
 │                         └────┬────┘                                 │
 └──────────────────────────────┼──────────────────────────────────────┘
                                │
@@ -120,6 +120,7 @@
 3. **内存安全**：敏感数据使用 `zeroize` 清理
 4. **逐条目加密**：每条密码独立加密，避免一次性解密整个数据库
 5. **防御深度**：多层安全防护，任何一层失效不代表系统崩溃
+6. **异步优先**：耗时操作（KDF、数据库 I/O）使用异步 FFI 避免 UI 阻塞
 
 ---
 
@@ -141,7 +142,7 @@
 |------|------|
 | **UI Screens** | HomeScreen, VaultScreen, EntryForm, PasswordGenerator, Settings |
 | **State Management** | **Riverpod**（推荐：编译时安全、更好的测试支持） |
-| **FFI Bridge** | `passkeep_ffi.dart` - 使用 `flutter_rust_bridge` 自动生成 |
+| **FFI Bridge** | `passkeep_ffi.dart` - 使用 `flutter_rust_bridge` 自动生成，异步调用 |
 | **Services** | VaultService, ClipboardService |
 
 ### 4.3 数据结构
@@ -162,13 +163,13 @@ pub struct EncryptedEntry {
     pub updated_at: i64,
 }
 
-// 主密钥派生参数
-#[derive(Serialize, Deserialize, Clone)]
+// 主密钥派生参数（使用 HKDF-Extract 扩展）
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct KdfParams {
-    pub salt: [u8; 32],        // 随机盐值
-    pub mem_cost_kib: u32,     // 内存成本（默认 262144 KiB = 256MB）
-    pub time_cost: u32,        // 迭代次数（默认 3）
-    pub parallelism: u32,      // 并行度（默认 4）
+    pub salt: [u8; 32],        // HKDF salt
+    pub mem_cost_kib: u32,     // 内存成本
+    pub time_cost: u32,        // 迭代次数
+    pub parallelism: u32,      // 并行度
 }
 
 // 密钥文件磁盘格式
@@ -177,18 +178,18 @@ pub struct KdfParams {
 // [0-3]    Magic: "PKEY" (0x59454B50)
 // [4-7]    Version: u32 (当前 = 1)
 // [8-39]   Secret: [u8; 32] - 密钥材料
-// [40-75]  Checksum: [u8; 36] - BLAKE3(secret + version)
-// Total: 76 bytes
+// [40-71]  Checksum: [u8; 32] - BLAKE3(secret || version)
+// Total: 72 bytes
 //
 // 校验和使用 BLAKE3（不需要密钥），校验文件完整性。
 pub const KEYFILE_MAGIC: &[u8; 4] = b"PKEY";
 pub const KEYFILE_VERSION: u32 = 1;
-pub const KEYFILE_SIZE: usize = 76;
+pub const KEYFILE_SIZE: usize = 72;
 
 pub struct KeyFile {
     pub version: u32,
     pub secret: [u8; 32],      // 32字节随机密钥材料
-    pub checksum: [u8; 36],    // BLAKE3(secret || version) 输出前36字节
+    pub checksum: [u8; 32],    // BLAKE3 输出完整 32 字节
 }
 
 // 保险库元数据
@@ -202,6 +203,93 @@ pub struct VaultMetadata {
 
 // 主密钥（内存中，使用 Zeroizing 包装）
 pub type MasterKey = Zeroizing<[u8; 32]>;
+
+// ============ FFI 数据结构 ============
+
+/// 用于创建/更新条目的输入（包含明文敏感数据）
+#[derive(Serialize, Deserialize, Debug)]
+pub struct EntryInput {
+    pub id: Option<String>,        // None 表示新建，Some 表示更新
+    pub title: String,
+    pub username: String,           // 明文
+    pub password: String,           // 明文
+    pub url: Option<String>,        // 明文
+    pub notes: Option<String>,      // 明文
+    pub folder_id: Option<String>,
+    pub tags: Vec<String>,
+}
+
+/// 条目元数据（不含敏感信息，可直接显示）
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct EntryMetadata {
+    pub id: String,
+    pub title: String,
+    pub url_preview: Option<String>, // URL 的前 50 字符
+    pub username: String,           // 用户名可明文存储用于识别
+    pub folder_id: Option<String>,
+    pub tags: Vec<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// 完整条目（包含解密后的敏感数据）
+#[derive(Serialize, Deserialize, Debug)]
+pub struct Entry {
+    pub id: String,
+    pub title: String,
+    pub username: String,
+    pub password: String,           // 明文（仅在需要时返回）
+    pub url: Option<String>,
+    pub notes: Option<String>,
+    pub folder_id: Option<String>,
+    pub tags: Vec<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+// ============ 密码生成器配置 ============
+
+/// 密码生成器配置
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PasswordGeneratorConfig {
+    /// 密码长度（默认 20）
+    pub length: u8,
+
+    /// 字符集选项
+    pub character_sets: CharacterSets,
+
+    /// 排除相似字符（如 0/O, 1/l/I）
+    pub exclude_similar: bool,
+
+    /// 排除模糊字符（如 {}, [], (), /, \, ", ', `, ,, ;, :, ., <, >）
+    pub exclude_ambiguous: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct CharacterSets {
+    pub uppercase: bool,    // A-Z
+    pub lowercase: bool,    // a-z
+    pub digits: bool,       // 0-9
+    pub symbols: bool,      // !@#$%^&*()_+-=[]{}|;:,.<>?
+    pub custom: String,     // 自定义字符集（优先使用）
+}
+
+impl Default for PasswordGeneratorConfig {
+    fn default() -> Self {
+        Self {
+            length: 20,
+            character_sets: CharacterSets {
+                uppercase: true,
+                lowercase: true,
+                digits: true,
+                symbols: true,
+                custom: String::new(),
+            },
+            exclude_similar: true,
+            exclude_ambiguous: false,
+        }
+    }
+}
 ```
 
 ---
@@ -220,7 +308,7 @@ pub type MasterKey = Zeroizing<[u8; 32]>;
 ├── security/
 │   └── lock_state.json               # 暴力破解防护状态（明文）
 ├── backups/
-│   ├── vault_20260403_143000.db      # 时间戳命名的备份
+│   ├── vault_20260403_143000.db      # 时间戳命名的备份（最多 5 个）
 │   └── vault_20260403_120000.db
 └── exports/
     └── export_20260403.json.enc      # 加密导出文件
@@ -245,21 +333,31 @@ pub type MasterKey = Zeroizing<[u8; 32]>;
 
 ### 6.1 派生公式
 
-```
+使用 HKDF 增强（防止边界攻击）：
+
+```rust
+// Step 1: 从密钥文件和主密码提取盐值
+let hkdf_salt = hkdf_extract(
+    ikm = keyfile_secret || kdf_salt,  // 64 字节输入
+    salt = None,                        // 使用默认盐
+); // 输出 32 字节
+
+// Step 2: 使用 Argon2id 派生主密钥
 master_key = Argon2id(
     password = master_password,
-    salt = keyfile_secret || kdf_salt,
-    mem_cost = 256 MB,
-    time_cost = 3,
-    parallelism = 4,
+    salt = hkdf_salt,                   // 32 字节
+    mem_cost = kdf_params.mem_cost_kib,
+    time_cost = kdf_params.time_cost,
+    parallelism = kdf_params.parallelism,
     output_length = 32 bytes
-)
+);
 ```
 
 **说明**：
 - `keyfile_secret`: 32字节，从密钥文件读取
 - `kdf_salt`: 32字节，创建保险库时生成，存储在数据库中
-- 两者拼接形成 64 字节的盐值
+- HKDF-Extract 提供明确的边界，防止拼接攻击
+- 使用 `hkdf` crate 实现
 
 ### 6.2 密钥文件验证流程
 
@@ -267,28 +365,37 @@ master_key = Argon2id(
 fn validate_keyfile(path: &Path) -> Result<KeyFile, PassKeepError> {
     let data = fs::read(path)?;
 
-    // 1. 检查 magic
+    // 1. 检查文件大小
+    if data.len() != KEYFILE_SIZE {
+        return Err(PassKeepError::KeyFileInvalid);
+    }
+
+    // 2. 检查 magic
     if data[0..4] != KEYFILE_MAGIC {
         return Err(PassKeepError::KeyFileInvalid);
     }
 
-    // 2. 检查版本
+    // 3. 检查版本
     let version = u32::from_le_bytes(data[4..8].try_into()?);
     if version != KEYFILE_VERSION {
         return Err(PassKeepError::KeyFileVersionMismatch);
     }
 
-    // 3. 提取 secret 和 checksum
-    let secret = data[8..40].try_into()?;
-    let stored_checksum = &data[40..76];
+    // 4. 提取 secret 和 checksum
+    let secret: [u8; 32] = data[8..40].try_into()?;
+    let stored_checksum: [u8; 32] = data[40..72].try_into()?;
 
-    // 4. 计算并验证 checksum
-    let computed_checksum = blake3::hash(&[secret, &version.to_le_bytes()].concat());
-    if computed_checksum.as_bytes()[0..36] != stored_checksum {
+    // 5. 计算并验证 checksum
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&secret);
+    hasher.update(&version.to_le_bytes());
+    let computed_checksum = hasher.finalize();
+
+    if computed_checksum.as_bytes() != &stored_checksum {
         return Err(PassKeepError::KeyFileCorrupted);
     }
 
-    Ok(KeyFile { version, secret, checksum: stored_checksum.try_into()? })
+    Ok(KeyFile { version, secret, checksum: stored_checksum })
 }
 ```
 
@@ -299,6 +406,9 @@ fn validate_keyfile(path: &Path) -> Result<KeyFile, PassKeepError> {
 ### 7.1 SQLite 表结构
 
 ```sql
+-- 启用外键约束（必须在每次连接时设置）
+PRAGMA foreign_keys = ON;
+
 -- 保险库元数据表（单行）
 CREATE TABLE vault_metadata (
     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -363,6 +473,18 @@ CREATE INDEX idx_entries_folder ON entries(folder_id);
 CREATE INDEX idx_folders_parent ON folders(parent_id);
 ```
 
+### 7.3 Nonce 冲突处理
+
+当创建新条目时：
+1. 生成随机 12 字节 nonce
+2. 尝试插入到数据库
+3. 如果因 UNIQUE 约束失败（nonce 冲突）：
+   - 重新生成 nonce
+   - 最多重试 10 次
+   - 10 次后仍失败则返回 `NonceGenerationFailed` 错误
+
+**概率分析**：12 字节随机数的冲突概率约为 2^-96，实际中不可能发生。UNIQUE 约束是防御性编程。
+
 ---
 
 ## 8. FFI 接口规范
@@ -370,69 +492,89 @@ CREATE INDEX idx_folders_parent ON folders(parent_id);
 ### 8.1 初始化与解锁
 
 ```rust
-// 初始化新的保险库
-#[frb(sync)]
-pub fn init_vault(
+/// 初始化新的保险库
+#[frb(async)]
+pub async fn init_vault(
     config_path: String,
     master_password: String,
     keyfile_path: String,
     kdf_params: KdfParams,
-) -> Result<(), PassKeepError>
+) -> Result<VaultMetadata, PassKeepError>
 
-// 解锁现有保险库
-#[frb(sync)]
-pub fn unlock_vault(
+/// 解锁现有保险库（异步，耗时操作）
+#[frb(async)]
+pub async fn unlock_vault(
     config_path: String,
     master_password: String,
     keyfile_path: String,
 ) -> Result<VaultMetadata, PassKeepError>
 
-// 锁定保险库（清除内存中的密钥）
+/// 锁定保险库（清除内存中的密钥）
 #[frb(sync)]
 pub fn lock_vault()
 
-// 检查锁定状态
+/// 检查锁定状态
 #[frb(sync)]
 pub fn is_locked() -> bool
+
+/// 获取剩余锁定时间（秒）
+#[frb(sync)]
+pub fn get_lock_remaining_seconds() -> i64
 ```
 
 ### 8.2 条目操作
 
 ```rust
-// 创建条目
-#[frb(sync)]
-pub fn create_entry(entry: EntryInput) -> Result<String, PassKeepError>
+/// 创建条目
+#[frb(async)]
+pub async fn create_entry(entry: EntryInput) -> Result<String, PassKeepError>
 
-// 获取条目（返回解密后的明文）
-#[frb(sync)]
-pub fn get_entry(id: String) -> Result<Entry, PassKeepError>
+/// 获取条目（返回解密后的明文）
+#[frb(async)]
+pub async fn get_entry(id: String) -> Result<Entry, PassKeepError>
 
-// 列出所有条目（仅返回元数据，不解密敏感字段）
-#[frb(sync)]
-pub fn list_entries() -> Result<Vec<EntryMetadata>, PassKeepError>
+/// 列出所有条目（仅返回元数据，不解密敏感字段）
+#[frb(async)]
+pub async fn list_entries() -> Result<Vec<EntryMetadata>, PassKeepError>
 
-// 搜索条目
-#[frb(sync)]
-pub fn search_entries(query: String) -> Result<Vec<EntryMetadata>, PassKeepError>
+/// 搜索条目
+#[frb(async)]
+pub async fn search_entries(query: String) -> Result<Vec<EntryMetadata>, PassKeepError>
 
-// 更新条目
-#[frb(sync)]
-pub fn update_entry(id: String, entry: EntryInput) -> Result<(), PassKeepError>
+/// 更新条目
+#[frb(async)]
+pub async fn update_entry(id: String, entry: EntryInput) -> Result<(), PassKeepError>
 
-// 删除条目
-#[frb(sync)]
-pub fn delete_entry(id: String) -> Result<(), PassKeepError>
+/// 删除条目
+#[frb(async)]
+pub async fn delete_entry(id: String) -> Result<(), PassKeepError>
+
+/// 批量删除条目
+#[frb(async)]
+pub async fn delete_entries(ids: Vec<String>) -> Result<usize, PassKeepError>
 ```
 
 ### 8.3 密钥轮换
 
 ```rust
-// 修改主密码
-#[frb(sync)]
-pub fn change_master_password(
+/// 修改主密码
+#[frb(async)]
+pub async fn change_master_password(
     old_password: String,
     new_password: String,
 ) -> Result<(), PassKeepError>
+```
+
+### 8.4 密码生成器
+
+```rust
+/// 生成随机密码
+#[frb(sync)]
+pub fn generate_password(config: PasswordGeneratorConfig) -> Result<String, PassKeepError>
+
+/// 估算密码强度（返回熵值）
+#[frb(sync)]
+pub fn estimate_password_strength(password: String) -> f64
 ```
 
 ---
@@ -446,7 +588,7 @@ pub fn change_master_password(
     ↓
 Rust: 读取 security/lock_state.json
     ↓
-检查当前时间 < lock_until?
+检查 current_time < lock_until?
     YES → 返回 VaultLocked 错误，显示剩余时间
     NO  → 继续
     ↓
@@ -454,11 +596,9 @@ Rust: 读取密钥文件，验证 BLAKE3 校验和
     ↓
 Rust: 从数据库读取 kdf_salt 和参数
     ↓
-Rust: master_key = Argon2id(
-        master_password,
-        keyfile_secret || kdf_salt,
-        params
-    )
+Rust: hkdf_salt = HKDF-Extract(keyfile_secret || kdf_salt)
+    ↓
+Rust: master_key = Argon2id(master_password, hkdf_salt, params) [异步]
     ↓
 Rust: 尝试用 master_key 解密 master_key_check.value_encrypted
     ↓
@@ -467,7 +607,8 @@ Rust: 尝试用 master_key 解密 master_key_check.value_encrypted
               返回 VaultMetadata
     ↓
     FAILURE → failed_attempts++
-              计算延迟: min(2^failed_attempts, 300) 秒
+              delay = min(2^failed_attempts, 300) 秒
+              lock_until = current_time + delay
               更新 lock_state.json
               返回 WrongPassword 错误
 ```
@@ -479,15 +620,15 @@ Flutter UI → VaultService.create_entry(EntryInput)
     ↓
 Rust FFI: 生成新的 12 字节随机 nonce
     ↓
-Rust: 检查 nonce 是否已存在（极低概率）
-    已存在 → 重新生成
+Rust: 尝试插入，检查 nonce 唯一性
+    冲突 → 重新生成（最多 10 次）
     ↓
 Rust: FOR EACH sensitive_field:
         encrypted = AES-256-GCM(plaintext, master_key, nonce)
     ↓
 storage::save_entry(EncryptedEntry { nonce, encrypted_fields... })
     ↓
-创建数据库备份（覆盖最旧的备份，保留最多5个）
+创建数据库备份（滚动策略）
 ```
 
 ### 9.3 密钥轮换流程
@@ -506,11 +647,11 @@ FOR EACH entry IN database:
     ↓
 重新加密 master_key_check
     ↓
-可选：生成新的 kdf_salt
+创建标记备份 vault_<timestamp>_pre_keychange.db
     ↓
-备份数据库（轮换前，带标记 _pre_keychange）
+删除所有旧备份（包括 _pre_keychange 之外的备份）
     ↓
-清除旧备份（7天前的所有备份）
+更新数据库 metadata
 ```
 
 ---
@@ -521,35 +662,39 @@ FOR EACH entry IN database:
 
 | 数据 | 加密方式 | 说明 |
 |------|----------|------|
-| 主密码派生密钥 | Argon2id | mem: 256MB, time: 3, parallelism: 4 (可配置) |
-| 各字段内容 | AES-256-GCM | 每条目独立 nonce，AEAD 模式内置认证 |
+| 主密码派生密钥 | HKDF + Argon2id | HKDF 防拼接攻击，Argon2id 抗 GPU |
+| 各字段内容 | AES-256-GCM | 每条目独立 nonce，AEAD 模式 |
 | 密钥文件 | 随机 32 字节 | 作为主密码派生的额外输入 |
-| Nonce 生成 | CSPRNG (getrandom) | 每条目 12 字节，数据库 UNIQUE 约束保证唯一性 |
-| 密钥文件校验 | BLAKE3 | 无密钥哈希，用于完整性验证 |
+| Nonce 生成 | CSPRNG (getrandom) | 每条目 12 字节，UNIQUE 约束 |
+| 密钥文件校验 | BLAKE3 | 32 字节，完整性验证 |
 
 ### 10.2 Argon2id 参数配置
 
-参数应根据用户硬件能力可配置（在设置中提供"安全级别"选项）：
-
 | 级别 | 内存 | 迭代 | 并行度 | 预计时间 | 适用场景 |
 |------|------|------|--------|----------|----------|
-| 低 | 64MB | 2 | 2 | ~100ms | 低端设备 |
+| 低 | 128MB | 2 | 2 | ~200ms | 低端设备 |
 | 中（默认） | 256MB | 3 | 4 | ~500ms | 标准设备 |
 | 高 | 1GB | 5 | 8 | ~2s | 高性能设备 |
 
 ### 10.3 暴力破解防护
 
-| 机制 | 实现方式 | 存储位置 |
-|------|----------|----------|
-| 失败计数 | 每次失败 `failed_attempts++` | `security/lock_state.json` |
-| 指数退避 | `min(2^n, 300)` 秒延迟 | 内存计算 + JSON 存储 |
-| 强制锁定 | 5次失败后锁定，每次失败增加延迟 | `lock_state.lock_until` |
-
-**防护逻辑**：
 ```rust
-let delay_secs = (1 << failed_attempts.min(8)).min(300); // max 5分钟
-lock_until = current_time + delay_secs;
+// 延迟计算（指数退避，上限 5 分钟）
+fn calculate_lockout_delay(failed_attempts: u32) -> u64 {
+    let exponent = failed_attempts.min(8);  // 2^8 = 256
+    let delay_secs = (1u64 << exponent).min(300);
+    delay_secs
+}
 ```
+
+| 失败次数 | 延迟时间 |
+|----------|----------|
+| 1 | 2 秒 |
+| 2 | 4 秒 |
+| 3 | 8 秒 |
+| 4 | 16 秒 |
+| 5 | 32 秒 |
+| 6+ | 64 秒 ~ 5 分钟（最大） |
 
 ### 10.4 备份策略
 
@@ -558,8 +703,10 @@ lock_until = current_time + delay_secs;
 | 备份频率 | 每次修改操作后 |
 | 保留数量 | 最多 5 个滚动备份 |
 | 命名格式 | `vault_YYYYMMDD_HHMMSS.db` |
-| 旧备份清理 | 7 天后自动删除 |
-| 密钥轮换 | 轮换前标记 `_pre_keychange`，轮换后清除旧备份 |
+| 清理策略 | 创建新备份时，删除最旧的备份 |
+| 密钥轮换 | 创建 `_pre_keychange` 标记备份后，删除所有其他备份 |
+
+**统一策略**：保留最新的 5 个备份。密钥轮换后，所有旧备份都被视为不安全，因此全部删除（除了刚创建的标记备份）。
 
 ### 10.5 安全措施
 
@@ -568,9 +715,21 @@ lock_until = current_time + delay_secs;
 | 内存清理 | 敏感数据使用 `Zeroizing<Vec<u8>>` 包装 |
 | 密钥不落地 | 派生的主密钥只存在于内存，不写入任何文件 |
 | 防剪贴板泄露 | 复制后 30 秒自动清除 |
-| 防截屏录屏 | macOS: `NSWindowSharingNone`, Windows: `SetWindowDisplayAffinity` |
+| 防截屏录屏 | macOS: `NSWindowSharingNone`<br>Windows: `SetWindowDisplayAffinity`<br>Linux: **有限支持**（Wayland 协议限制） |
 | 自动锁定 | 无操作 5 分钟后清除内存中的 master_key |
 | 防重放攻击 | Nonce 数据库 UNIQUE 约束 |
+
+### 10.6 平台特定说明
+
+**剪贴板处理**：
+- **macOS/Windows**: 标准 clipboard API，30 秒后清除
+- **Linux (X11)**: 同时处理 primary selection 和 clipboard
+- **Linux (Wayland)**: 仅 clipboard（Wayland 协议限制）
+
+**防截屏**：
+- **macOS**: `NSWindowSharingNone` 完全支持
+- **Windows**: `SetWindowDisplayAffinity` 完全支持
+- **Linux**: **不支持**（X11/Wayland 无标准 API）
 
 ---
 
@@ -579,18 +738,17 @@ lock_until = current_time + delay_secs;
 ### 11.1 SQLite 并发配置
 
 ```rust
-// SQLite 连接配置
 fn open_database(path: &Path) -> Result<Connection, PassKeepError> {
     let conn = Connection::open(path)?;
 
     // 启用 WAL 模式（更好的并发性）
     conn.execute("PRAGMA journal_mode=WAL", [])?;
 
-    // 设置 busy_timeout（等待锁的最长时间）
-    conn.execute("PRAGMA busy_timeout=5000", [])?; // 5秒
+    // 启用外键约束
+    conn.execute("PRAGMA foreign_keys=ON", [])?;
 
-    // 单写者模式（密码管理器通常是单用户）
-    conn.execute("PRAGMA locking_mode=NORMAL", [])?;
+    // 设置 busy_timeout（等待锁的最长时间）
+    conn.execute("PRAGMA busy_timeout=5000", [])?;
 
     Ok(conn)
 }
@@ -603,22 +761,15 @@ fn open_database(path: &Path) -> Result<Connection, PassKeepError> {
 | 写入过程中崩溃 | SQLite WAL 自动回滚未完成的事务 |
 | 数据库损坏 | 检测损坏后提示用户从备份恢复 |
 | 密钥文件损坏 | 提示用户从备份恢复（如有） |
-| 应用崩溃重启 | 内存状态丢失，需要重新解锁（符合预期） |
+| 应用崩溃重启 | 内存状态丢失，需要重新解锁 |
 
 ### 11.3 事务一致性
 
 ```rust
-// 所有修改操作在事务中执行
 conn.transaction(|tx| {
-    // 1. 执行修改
     tx.execute(...)?;
-
-    // 2. 更新时间戳
     tx.execute(...)?;
-
-    // 3. 创建备份
     create_backup(tx)?;
-
     Ok(())
 })?;
 ```
@@ -664,38 +815,73 @@ conn.transaction(|tx| {
 }
 ```
 
-**说明**：导出文件中的 `*_encrypted` 字段仍然是加密的，需要使用主密钥才能解密。导出文件可以用任何方式传输，即使被泄露也无法直接读取。
-
 ---
 
 ## 13. 错误处理
 
 ```rust
+#[derive(Debug, thiserror::Error)]
 pub enum PassKeepError {
     // 认证相关
+    #[error("Incorrect master password")]
     WrongPassword,
-    KeyFileNotFound,
+
+    #[error("Key file not found: {0}")]
+    KeyFileNotFound(String),
+
+    #[error("Invalid key file format")]
     KeyFileInvalid,
+
+    #[error("Key file is corrupted")]
     KeyFileCorrupted,
-    KeyFileVersionMismatch,
-    VaultLocked(i64),  // 参数：解锁时间戳
+
+    #[error("Unsupported key file version: {0}")]
+    KeyFileVersionMismatch(u32),
+
+    #[error("Vault is locked. Try again in {0} seconds")]
+    VaultLocked(i64),
 
     // 加密相关
+    #[error("Encryption failed")]
     EncryptionFailed,
+
+    #[error("Decryption failed")]
     DecryptionFailed,
+
+    #[error("Invalid nonce")]
     InvalidNonce,
-    NonceReuseAttempt, // 尝试重用 nonce
+
+    #[error("Failed to generate unique nonce after 10 attempts")]
+    NonceGenerationFailed,
 
     // 存储相关
+    #[error("Database is locked")]
     DatabaseLocked,
+
+    #[error("Database is corrupted")]
     DatabaseCorrupted,
-    EntryNotFound,
+
+    #[error("Entry not found: {0}")]
+    EntryNotFound(String),
+
+    #[error("Backup failed")]
     BackupFailed,
 
     // 系统相关
+    #[error("Unauthorized access")]
     UnauthorizedAccess,
+
+    #[error("Disk full")]
     DiskFull,
+
+    #[error("Invalid KDF parameters")]
     InvalidKdfParams,
+
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("SQLite error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
 }
 ```
 
@@ -727,6 +913,7 @@ passkeep/
 │   │   │   ├── mod.rs
 │   │   │   ├── aes.rs
 │   │   │   ├── argon2.rs
+│   │   │   ├── hkdf.rs
 │   │   │   └── rng.rs
 │   │   ├── storage/           # 存储模块
 │   │   │   ├── mod.rs
@@ -735,7 +922,8 @@ passkeep/
 │   │   ├── models/            # 数据模型
 │   │   │   ├── mod.rs
 │   │   │   ├── vault.rs
-│   │   │   └── entry.rs
+│   │   │   ├── entry.rs
+│   │   │   └── password.rs
 │   │   ├── import_export/     # 导入导出
 │   │   │   ├── mod.rs
 │   │   │   └── json_format.rs
@@ -796,6 +984,7 @@ passkeep/
 |------|------|------|
 | `aes-gcm` | ^0.10 | AES-256-GCM 加密 |
 | `argon2` | ^0.5 | 密钥派生 |
+| `hkdf` | ^0.12 | HKDF-Extract |
 | `blake3` | ^1.5 | 密钥文件校验和 |
 | `rusqlite` | ^0.30 | SQLite 数据库 |
 | `zeroize` | ^1.6 | 安全内存清理 |
@@ -811,7 +1000,6 @@ passkeep/
 | `flutter_rust_bridge` | ^2.0 | FFI 代码生成 |
 | `riverpod` | ^2.4 | 状态管理 |
 | `flutter_local_notifications` | ^16.0 | 剪贴板清除通知 |
-| `flutter_l10n` | - | 内置国际化 |
 
 ---
 
@@ -830,22 +1018,21 @@ passkeep/
 
 ### 17.2 关键测试场景
 
-- **加密往返**：明文 → 加密 → 解密 → 明文，验证一致性
-- **密钥派生**：相同输入产生相同密钥，不同输入产生不同密钥
-- **数据库锁定/解锁**：验证 master_key 清除后的锁定状态
-- **nonce 唯一性**：尝试重用 nonce 应返回错误
-- **导入/导出**：导出后导入，验证数据完整性
+- **加密往返**：明文 → 加密 → 解密 → 明文
+- **密钥派生**：相同输入产生相同密钥
+- **nonce 唯一性**：重用 nonce 应返回错误
+- **导入/导出**：导出后导入验证完整性
 - **FFI 内存**：长时间运行无内存泄漏
-- **并发访问**：多个操作同时执行的数据一致性
+- **nonce 冲突处理**：模拟冲突后重新生成
 
 ### 17.3 模糊测试目标
 
 | 目标 | 输入范围 | 预期行为 |
 |------|----------|----------|
-| 加密函数 | 任意长度字节串 | 绝不崩溃，返回错误或有效密文 |
-| KDF 函数 | 任意密码长度 | 绝不崩溃，执行时间合理 |
-| 数据库解析 | 损坏的 SQLite 文件 | 返回 DatabaseCorrupted 错误 |
-| 密钥文件解析 | 任意字节文件 | 返回 KeyFileInvalid 错误 |
+| 加密函数 | 任意长度字节串 | 绝不崩溃 |
+| KDF 函数 | 任意密码长度 | 绝不崩溃 |
+| 数据库解析 | 损坏的 SQLite 文件 | 返回错误 |
+| 密钥文件解析 | 任意字节文件 | 返回错误 |
 
 ---
 
@@ -861,14 +1048,11 @@ jobs:
     - cargo fmt --check
     - cargo clippy -- -D warnings
     - cargo test
-    - cargo fuzz ...  # 如果有 fuzzer
   flutter:
     - flutter analyze
     - flutter test
-    - flutter test integration_test
   security:
-    - cargo audit  # 依赖漏洞扫描
-    - flutter pub run dependency_validator
+    - cargo audit
 ```
 
 ### 18.2 安全审计
@@ -876,73 +1060,26 @@ jobs:
 | 工具 | 频率 | 作用 |
 |------|------|------|
 | `cargo audit` | 每次 CI | 检查 Rust 依赖漏洞 |
-| `cargo-deny` | 每周 | 许可证检查、依赖审计 |
-| `flutter pub dependency_validator` | 每次 CI | Flutter 依赖检查 |
+| `cargo-deny` | 每周 | 许可证检查 |
 | 手动代码审查 | 每个 PR | 安全敏感代码双人审查 |
 
-### 18.3 发布前检查清单
-
-- [ ] 所有测试通过
-- [ ] 无依赖漏洞
-- [ ] FFI 边界测试通过
-- [ ] 内存泄漏检测（Valgrind/Instruments）
-- [ ] 性能基准测试达标
-- [ ] 跨平台测试（macOS/Windows/Linux）
-
 ---
 
-## 19. 国际化与无障碍
-
-### 19.1 国际化 (i18n)
-
-- 使用 Flutter 内置 `flutter_localizations`
-- 首批支持：简体中文、英文
-- 所有用户可见字符串通过 `AppLocalizations` 访问
-- 日期/时间格式本地化
-
-### 19.2 无障碍 (a11y)
-
-- 所有交互元素添加 `Semantics` 标签
-- 支持键盘导航
-- 支持屏幕阅读器（macOS VoiceOver, Windows Narrator）
-- 高对比度模式支持
-- 字体大小缩放支持
-
----
-
-## 20. 用户体验
+## 19. 用户体验
 
 | 场景 | 处理方式 |
 |------|----------|
-| 首次启动 | 引导创建主密码 + 生成密钥文件 → 备份提醒 |
-| 忘记主密码 | 明确警告：数据无法恢复，提示检查备份 |
+| 首次启动 | 引导创建主密码 + 生成密钥文件 |
+| 忘记主密码 | 明确警告：数据无法恢复 |
 | 数据库损坏 | 自动检测备份文件，提示恢复 |
-| 导入导出 | 支持加密 JSON 格式，导出前验证文件完整性 |
-| 密码强度提示 | 实时显示密码强度条（熵值估算） |
-| 自动保存 | 编辑后自动保存，减少手动操作 |
+| 密码强度提示 | 实时显示熵值 |
 
 ---
 
-## 21. 版本管理与迁移
+## 20. 未来扩展方向
 
-### 21.1 数据库版本
-
-- `vault_metadata.version` 存储当前数据库格式版本
-- 启动时检查版本，必要时执行迁移
-
-### 21.2 迁移策略
-
-- 每次数据库结构变更更新版本号
-- 提供向前迁移脚本
-- 保留向后兼容性（至少一个版本）
-- 迁移前自动备份
-
----
-
-## 22. 未来扩展方向
-
-1. **浏览器扩展** - WebSocket 本地通信，自动填充网页表单
-2. **移动端** - 共享 Rust 核心库，Flutter 原生支持
-3. **YubiKey 支持** - 硬件密钥作为第三认证因素
-4. **SSH 密钥管理** - 扩展支持 SSH 密钥存储
-5. **TOTP 代码** - 内置双因素认证码生成器
+1. **浏览器扩展** - WebSocket 本地通信
+2. **移动端** - 共享 Rust 核心库
+3. **YubiKey 支持** - 硬件密钥
+4. **SSH 密钥管理**
+5. **TOTP 代码**

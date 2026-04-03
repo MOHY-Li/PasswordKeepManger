@@ -100,8 +100,13 @@ pub struct VaultDb {
 impl VaultDb {
     pub fn new(conn: Arc<Mutex<rusqlite::Connection>>) -> Self {
         // 启用 WAL 模式以支持更好的并发性能
+        // 注意：WAL 启用失败（如只读文件系统）不会中断初始化，
+        // 但可能导致并发性能下降。生产环境应确保文件系统可写。
         let conn_guard = conn.lock().unwrap();
-        conn_guard.execute("PRAGMA journal_mode=WAL", []).ok();
+        if let Err(e) = conn_guard.execute("PRAGMA journal_mode=WAL", []) {
+            // 记录警告但不中断（数据库仍可正常运行，只是并发受限）
+            eprintln!("Warning: Failed to enable WAL mode: {}", e);
+        }
         drop(conn_guard);
         Self { conn }
     }
@@ -118,19 +123,19 @@ impl VaultDb {
 ```rust
 impl VaultManager {
     pub fn new() -> Self;
-    
+
     // 利用 RwLock 内部可变性，&self 即可
     pub fn create_vault(&self, ...) -> Result<VaultHandle, PassKeepError>;
     pub fn unlock_vault(&self, ...) -> Result<VaultHandle, PassKeepError>;
     pub fn lock_vault(&self, handle: VaultHandle) -> Result<(), PassKeepError>;
-    
+
     // 获取会话的 Arc 克隆（支持跨线程传递）
     pub fn get_session(&self, handle: VaultHandle) -> Option<Arc<Mutex<VaultSession>>>;
-    
-    // 内部使用：获取可变引用（需要写锁）
-    fn with_session_mut<F, R>(&self, handle: VaultHandle, f: F) -> Option<R>
+
+    // 内部使用：在写锁内执行可变操作
+    fn with_session_mut<F, R>(&self, handle: VaultHandle, f: F) -> Result<R, PassKeepError>
     where
-        F: FnOnce(&mut VaultSession) -> R;
+        F: FnOnce(&mut VaultSession) -> Result<R, PassKeepError>;
 }
 
 // 全局访问器
@@ -585,7 +590,9 @@ use dirs::data_dir;
 
 fn backup_dir() -> PathBuf {
     let base = data_dir()
-        .unwrap_or_else(|| std::env::temp_dir());  // 降级到系统临时目录（通常可写）
+        .unwrap_or_else(|| std::env::temp_dir());  // 仅作为 fallback，多用户系统有风险
+    // 安全警告：temp_dir() 在多用户系统上可能可被其他用户读取
+    // 生产环境应确保 dirs::data_dir() 返回有效路径（如 ~/.local/share）
     let mut path = base;
     path.push("passkeep");
     path.push("backups");
@@ -593,19 +600,7 @@ fn backup_dir() -> PathBuf {
 }
 ```
 
-**VaultDb 初始化**：
-```rust
-impl VaultDb {
-    pub fn new(conn: Arc<Mutex<rusqlite::Connection>>) -> Self {
-        // 在连接初始化时启用 WAL 模式
-        let db = conn.clone();
-        let conn_guard = db.lock().unwrap();
-        conn_guard.execute("PRAGMA journal_mode=WAL", []).ok();
-        drop(conn_guard);
-        Self { conn: db }
-    }
-}
-```
+**VaultDb 初始化**：参见第 2.2 节的 `VaultDb::new` 定义（启用 WAL 模式）
 
 **防抖实现**：
 ```rust

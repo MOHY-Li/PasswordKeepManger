@@ -127,9 +127,11 @@ pub struct VaultDb {
 
 impl VaultDb {
     pub fn new(conn: Arc<Mutex<rusqlite::Connection>>) -> Self {
-        // 启用 WAL 模式
+        // 启用 WAL 模式（失败时记录警告但不中断）
         let conn_guard = conn.lock().unwrap();
-        conn_guard.execute("PRAGMA journal_mode=WAL", []).ok();
+        if let Err(e) = conn_guard.execute("PRAGMA journal_mode=WAL", []) {
+            eprintln!("Warning: Failed to enable WAL mode: {}", e);
+        }
         drop(conn_guard);
         Self { conn }
     }

@@ -72,17 +72,21 @@ pub type VaultHandle = u64;
 /// 使用 RwLock 保护内部 HashMap，支持多读单写
 pub struct VaultManager {
     next_handle: AtomicU64,
-    vaults: RwLock<HashMap<VaultHandle, VaultSession>>,
+    vaults: RwLock<HashMap<VaultHandle, Arc<Mutex<VaultSession>>>>,
 }
 
 /// 单个保险库会话
 /// 注意：实现了 ZeroizeOnDrop，确保密钥在内存中被安全清除
 #[derive(ZeroizeOnDrop)]
 pub struct VaultSession {
-    db: Arc<Mutex<Database>>,  // 数据库连接需要线程安全
     master_key: MasterKey,     // 自动 zeroize
     config_path: PathBuf,
     keyfile_path: PathBuf,
+}
+
+/// 数据库句柄（与 VaultSession 分离，避免循环引用）
+pub struct VaultDb {
+    conn: Arc<Mutex<Connection>>,
 }
 ```
 
@@ -209,11 +213,17 @@ VALUES (2, CAST(strftime('%s', 'now') AS INTEGER));
 ```rust
 impl VaultManager {
     pub fn new() -> Self;
-    pub fn create_vault(&mut self, ...) -> Result<VaultHandle, PassKeepError>;
-    pub fn unlock_vault(&mut self, ...) -> Result<VaultHandle, PassKeepError>;
-    pub fn lock_vault(&mut self, handle: VaultHandle) -> Result<(), PassKeepError>;
-    pub fn get_session(&self, handle: VaultHandle) -> Option<&VaultSession>;
-    pub fn get_session_mut(&mut self, handle: VaultHandle) -> Option<&mut VaultSession>;
+    
+    // &self 而非 &mut self，利用 RwLock 的内部可变性
+    pub fn create_vault(&self, ...) -> Result<VaultHandle, PassKeepError>;
+    pub fn unlock_vault(&self, ...) -> Result<VaultHandle, PassKeepError>;
+    pub fn lock_vault(&self, handle: VaultHandle) -> Result<(), PassKeepError>;
+    
+    // 内部使用（需要 &mut self）
+    fn get_session_mut(&mut self, handle: VaultHandle) -> Option<&mut VaultSession>;
+    
+    // 公共 API（返回 Arc 包装的引用，支持跨线程）
+    pub fn get_session(&self, handle: VaultHandle) -> Option<Arc<Mutex<VaultSession>>>;
 }
 ```
 
@@ -224,17 +234,33 @@ impl VaultManager {
 | 组件 | 职责 |
 |------|------|
 | `LockState` | 防护状态结构 |
-| `LockFile` | 文件锁保护 |
 
-**核心 API**:
+**核心 API**（与数据库集成）:
 ```rust
 impl LockState {
-    pub fn load(path: &Path) -> Result<Self, PassKeepError>;
-    pub fn save(&self, path: &Path) -> Result<(), PassKeepError>;
+    // 从数据库行加载
+    pub fn from_row(row: &rusqlite::Row) -> Result<Self, PassKeepError>;
+    
+    // 记录失败，返回新的锁定时长
     pub fn record_failure(&mut self) -> Duration;
+    
+    // 记录成功，重置失败计数
     pub fn record_success(&mut self);
+    
+    // 检查是否被锁定
     pub fn is_locked(&self) -> bool;
+    
+    // 获取剩余锁定时间
     pub fn remaining_lock_time(&self) -> Duration;
+}
+
+// 数据库辅助函数
+impl LockState {
+    // 在事务中读取 LockState
+    pub fn load_from_db(conn: &Connection) -> Result<Self, PassKeepError>;
+    
+    // 在事务中保存 LockState
+    pub fn save_to_db(&self, conn: &Connection) -> Result<(), PassKeepError>;
 }
 ```
 
@@ -249,13 +275,18 @@ impl LockState {
 **核心 API**:
 ```rust
 impl EntryService {
-    pub fn new(db: Database, master_key: MasterKey) -> Self;
-    pub fn create(&mut self, input: &EntryInput) -> Result<String, PassKeepError>;
+    // 接收 Arc<Mutex<Connection>> 和 MasterKey 引用
+    pub fn new(db: Arc<Mutex<Connection>>, master_key: &MasterKey) -> Self;
+    
+    pub fn create(&self, input: &EntryInput) -> Result<String, PassKeepError>;
     pub fn get(&self, id: &str) -> Result<Entry, PassKeepError>;
     pub fn list(&self) -> Result<Vec<EntryMetadata>, PassKeepError>;
     pub fn search(&self, query: &str) -> Result<Vec<EntryMetadata>, PassKeepError>;
-    pub fn update(&mut self, id: &str, input: &EntryInput) -> Result<(), PassKeepError>;
+    pub fn update(&self, id: &str, input: &EntryInput) -> Result<(), PassKeepError>;
     pub fn delete(&self, id: &str) -> Result<(), PassKeepError>;
+    
+    // 批量操作（避免多次触发备份）
+    pub fn create_batch(&self, entries: &[EntryInput]) -> Result<Vec<String>, PassKeepError>;
 }
 ```
 
@@ -410,18 +441,6 @@ master_key = Argon2id(
 - IKM 长度：32 字节（来自密钥文件）
 - Info：固定字符串 `"passkeep-argon2-salt"`
 - 输出长度：32 字节（argon_salt）
-        ↓
-master_key = Argon2id(password, argon_salt, kdf_params)
-        ↓
-解密 master_key_check 验证
-        ↓
-        ├── SUCCESS → 创建 VaultSession，返回 VaultHandle
-        │              更新 lock_state.json (failed_attempts = 0)
-        │
-        └── FAILURE → failed_attempts++
-                     更新 lock_until
-                     返回 WrongPassword 错误
-```
 
 ---
 
@@ -444,25 +463,28 @@ master_key = Argon2id(password, argon_salt, kdf_params)
 ### 6.2 备份管理详细设计
 
 **备份策略**：
-- **自动备份**：每次修改操作（创建/更新/删除条目）后触发
-- **手动备份**：用户主动触发的完整备份
+- **自动备份**：使用防抖机制，5 秒内的多次修改只触发一次备份
+- **手动备份**：用户主动触发的完整备份（立即执行）
 - **保留数量**：最多保留 5 个最新备份
 - **命名规则**：`vault_<timestamp>.db`
 
-**备份位置**：
-```
-~/.passkeep/backups/
-├── vault_20260404_120000.db
-├── vault_20260404_140000.db
-├── vault_20260404_160000.db
-├── vault_20260404_180000.db
-└── vault_20260404_200000.db
+**备份位置**（跨平台）：
+```rust
+use dirs::data_dir;
+
+fn backup_dir() -> PathBuf {
+    let mut path = data_dir().unwrap();  // ~/Library/Application Support on macOS
+    path.push("passkeep");
+    path.push("backups");
+    path
+}
 ```
 
 **备份清理**：
 - 创建新备份前检查现有备份数量
 - 超过 5 个时删除最旧的备份
 - 使用 SQLite VACUUM INTO 创建干净的备份副本
+- 使用 `fslock` 保护备份写入过程，防止并发损坏
 
 ---
 
@@ -530,9 +552,22 @@ zeroize = "1.8"
 subtle = "2.6"
 
 # Phase 2 新增依赖...
-fslock = "0.2.1"           # 文件锁（用于备份文件写入保护）
+fslock = "0.2.1"           # 文件锁（备份文件写入保护）
+dirs = "5.0"               # 跨平台路径获取
+
+# 异步支持（可选 feature）
 tokio = { version = "1.40", features = ["sync", "rt-multi-thread"], optional = true }
+
+[features]
+default = []
+async = ["tokio"]           # 启用异步支持（用于未来的 async FFI）
 
 [dev-dependencies]
 tempfile = "3.13"
 ```
+
+**数据库连接说明**：
+- SQLite 本身支持多读单写，配合 WAL 模式
+- 对于密码管理器的使用场景（单用户、单实例为主），单个连接足够
+- `Arc<Mutex<Connection>>` 提供 FFI 多线程安全访问
+- 未来如需多实例支持，可引入 r2d2 连接池

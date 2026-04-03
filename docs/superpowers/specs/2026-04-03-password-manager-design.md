@@ -377,7 +377,6 @@ pub struct ExportMetadata {
 ```rust
 use hkdf::Hkdf;
 use sha2::Sha256;
-use use::thiserror::Error;
 
 // hkdf crate 0.12 的正确 API
 let hkdf = Hkdf::<Sha256>::new(Some(&kdf_salt), &keyfile_secret);

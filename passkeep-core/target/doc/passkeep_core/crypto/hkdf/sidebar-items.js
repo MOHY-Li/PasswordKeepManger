@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["expand","expand_with_info"]};

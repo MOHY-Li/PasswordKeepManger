@@ -22,7 +22,8 @@ pub fn derive_key(
         params.clone(),
     );
 
-    argon.hash_password_into(password.as_bytes(), salt, &mut **output)
+    argon
+        .hash_password_into(password.as_bytes(), salt, &mut **output)
         .map_err(|_| PassKeepError::KeyDerivationFailed)?;
 
     Ok(())

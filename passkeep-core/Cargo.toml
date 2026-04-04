@@ -10,7 +10,7 @@ hkdf = "0.12"
 sha2 = "0.10"
 blake3 = "1.5"
 rusqlite = { version = "0.30", features = ["bundled"] }
-zeroize = "1.7"
+zeroize = { version = "1.7", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
@@ -18,6 +18,8 @@ uuid = { version = "1.6", features = ["v4", "serde"] }
 getrandom = "0.2"
 fslock = "0.2"
 subtle = "2.6"
+base64 = "0.22.1"
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3.8"

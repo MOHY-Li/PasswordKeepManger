@@ -1,0 +1,9 @@
+(function() {
+    const implementors = Object.fromEntries([["passkeep_core",[["impl <a class=\"trait\" href=\"https://doc.rust-lang.org/1.94.1/core/default/trait.Default.html\" title=\"trait core::default::Default\">Default</a> for <a class=\"struct\" href=\"passkeep_core/crypto/keyfile/struct.KeyFile.html\" title=\"struct passkeep_core::crypto::keyfile::KeyFile\">KeyFile</a>",0],["impl <a class=\"trait\" href=\"https://doc.rust-lang.org/1.94.1/core/default/trait.Default.html\" title=\"trait core::default::Default\">Default</a> for <a class=\"struct\" href=\"passkeep_core/models/password/struct.CharacterSets.html\" title=\"struct passkeep_core::models::password::CharacterSets\">CharacterSets</a>",0],["impl <a class=\"trait\" href=\"https://doc.rust-lang.org/1.94.1/core/default/trait.Default.html\" title=\"trait core::default::Default\">Default</a> for <a class=\"struct\" href=\"passkeep_core/models/password/struct.PasswordGeneratorConfig.html\" title=\"struct passkeep_core::models::password::PasswordGeneratorConfig\">PasswordGeneratorConfig</a>",0],["impl <a class=\"trait\" href=\"https://doc.rust-lang.org/1.94.1/core/default/trait.Default.html\" title=\"trait core::default::Default\">Default</a> for <a class=\"struct\" href=\"passkeep_core/storage/lock_state/struct.LockState.html\" title=\"struct passkeep_core::storage::lock_state::LockState\">LockState</a>",0],["impl <a class=\"trait\" href=\"https://doc.rust-lang.org/1.94.1/core/default/trait.Default.html\" title=\"trait core::default::Default\">Default</a> for <a class=\"struct\" href=\"passkeep_core/vault/struct.VaultManager.html\" title=\"struct passkeep_core::vault::VaultManager\">VaultManager</a>",0]]]]);
+    if (window.register_implementors) {
+        window.register_implementors(implementors);
+    } else {
+        window.pending_implementors = implementors;
+    }
+})()
+//{"start":59,"fragment_lengths":[1629]}

@@ -7,7 +7,6 @@ use aes_gcm::{
     aead::{Aead, AeadCore, KeyInit, OsRng},
     Aes256Gcm,
 };
-use zeroize::Zeroizing;
 
 /// AES-256-GCM 加密
 ///
@@ -104,19 +103,6 @@ pub fn decrypt_with_nonce(
     Ok(plaintext)
 }
 
-/// 主密钥类型（内存安全）
-pub type MasterKey = Zeroizing<[u8; 32]>;
-
-/// 从切片创建主密钥
-pub fn master_key_from_slice(slice: &[u8]) -> Option<MasterKey> {
-    if slice.len() != 32 {
-        return None;
-    }
-    let mut key = [0u8; 32];
-    key.copy_from_slice(slice);
-    Some(Zeroizing::new(key))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,21 +157,6 @@ mod tests {
         let result = decrypt_with_nonce(&ciphertext, &wrong_key, &nonce, aad);
 
         assert!(matches!(result, Err(PassKeepError::DecryptionFailed)));
-    }
-
-    #[test]
-    fn test_master_key_from_slice() {
-        let slice = [1u8; 32];
-        let key = master_key_from_slice(&slice);
-        assert!(key.is_some());
-        assert_eq!(key.unwrap().as_ref(), &slice);
-    }
-
-    #[test]
-    fn test_master_key_from_slice_wrong_length() {
-        let slice = [1u8; 16]; // Wrong length
-        let key = master_key_from_slice(&slice);
-        assert!(key.is_none());
     }
 
     #[test]

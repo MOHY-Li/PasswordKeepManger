@@ -6,7 +6,15 @@
 //! - JavaScript/WASM (via wasm-bindgen)
 //! - Mobile platforms (via JNI/Kotlin Native)
 //!
-//! # Status
-//! Currently a stub - FFI implementation will be added in future phases.
+//! # Modules
+//!
+//! ## simple
+//! A simple C FFI interface for Flutter integration.
+//! Each function returns an error code (`i32`), where 0 = success, non-zero = error type.
+//! The last error message is stored in thread-local storage and can be retrieved
+//! via `passkeep_get_last_error()`.
 
-// FFI implementations will be added here
+pub mod simple;
+
+// Re-export commonly used FFI types
+pub use simple::{ErrorCode, PasskeepEntry, VaultHandleC};

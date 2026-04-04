@@ -162,17 +162,11 @@ INSERT INTO schema_migrations (version, applied_at) VALUES (1, 1000000);
         apply_v2_migration(&conn).unwrap();
 
         // Verify default values for new columns
-        let (password_nonce, url_nonce, notes_nonce): (Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>) = conn
-            .query_row(
+        let (password_nonce, url_nonce, notes_nonce): (Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>) =
+            conn.query_row(
                 "SELECT password_nonce, url_nonce, notes_nonce FROM entries WHERE id = ?",
                 params!["test-id"],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?
-                    ))
-                },
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
 
@@ -280,7 +274,8 @@ INSERT INTO schema_migrations (version, applied_at) VALUES (1, 1000000);
         conn.execute(
             "INSERT INTO schema_migrations (version, applied_at) VALUES (2, 2000000)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Apply v2 migration - should skip without error
         apply_v2_migration(&conn).unwrap();

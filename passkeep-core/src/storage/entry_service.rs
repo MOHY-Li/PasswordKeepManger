@@ -35,10 +35,7 @@ impl EntryService {
     /// The ID of the created entry
     pub fn create(&self, input: &EntryInput) -> Result<String, PassKeepError> {
         // TODO: Persist encrypted data to SQLite database
-        let id = input
-            .id
-            .clone()
-            .unwrap_or_else(|| rng::generate_uuid());
+        let id = input.id.clone().unwrap_or_else(rng::generate_uuid);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -54,23 +51,31 @@ impl EntryService {
         )?;
 
         let url_nonce = input.url.as_ref().map(|_| rng::generate_nonce());
-        let url_encrypted = input.url.as_ref().and_then(|url| {
-            url_nonce.as_ref().map(|nonce| {
-                aes::encrypt_with_nonce(url.as_bytes(), self.master_key.as_bytes(), nonce, b"")
+        let url_encrypted = input
+            .url
+            .as_ref()
+            .and_then(|url| {
+                url_nonce.as_ref().map(|nonce| {
+                    aes::encrypt_with_nonce(url.as_bytes(), self.master_key.as_bytes(), nonce, b"")
+                })
             })
-        }).transpose()?;
+            .transpose()?;
 
         let notes_nonce = input.notes.as_ref().map(|_| rng::generate_nonce());
-        let notes_encrypted = input.notes.as_ref().and_then(|notes| {
-            notes_nonce.as_ref().map(|nonce| {
-                aes::encrypt_with_nonce(
-                    notes.as_bytes(),
-                    self.master_key.as_bytes(),
-                    nonce,
-                    b"",
-                )
+        let notes_encrypted = input
+            .notes
+            .as_ref()
+            .and_then(|notes| {
+                notes_nonce.as_ref().map(|nonce| {
+                    aes::encrypt_with_nonce(
+                        notes.as_bytes(),
+                        self.master_key.as_bytes(),
+                        nonce,
+                        b"",
+                    )
+                })
             })
-        }).transpose()?;
+            .transpose()?;
 
         // TODO: Implement SQL INSERT with encrypted data
         let _ = (password_encrypted, url_encrypted, notes_encrypted);

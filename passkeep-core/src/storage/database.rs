@@ -1,6 +1,6 @@
 //! Database operations
 
-use crate::models::{KdfParams, VaultMetadata};
+use crate::models::VaultMetadata;
 use crate::storage::error::PassKeepError;
 use crate::storage::lock_state::LockState;
 use rusqlite::{Connection, Result as SqliteResult};
@@ -70,7 +70,7 @@ impl Database {
 
                 Ok(VaultMetadata {
                     version: row.get(0)?,
-                    kdf_params: crate::models::KdfParams {
+                    kdf_params: crate::crypto::KdfParams {
                         salt,
                         mem_cost_kib: row.get(2)?,
                         time_cost: row.get(3)?,
@@ -87,9 +87,16 @@ impl Database {
     /// Check if the database is locked
     pub fn is_locked(&self) -> Result<bool, PassKeepError> {
         // Try to execute a simple query to check if database is accessible
-        match self.conn.query_row("SELECT 1", [], |_: &rusqlite::Row| Ok(())) {
+        match self
+            .conn
+            .query_row("SELECT 1", [], |_: &rusqlite::Row| Ok(()))
+        {
             Ok(_) => Ok(false),
-            Err(rusqlite::Error::SqliteFailure(err, _)) if err.code == rusqlite::ErrorCode::DatabaseBusy => Ok(true),
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if err.code == rusqlite::ErrorCode::DatabaseBusy =>
+            {
+                Ok(true)
+            }
             Err(_) => Ok(false),
         }
     }
@@ -132,7 +139,7 @@ impl Database {
     }
 
     /// Get KDF parameters from vault metadata
-    pub fn get_kdf_params(&self) -> Result<KdfParams, PassKeepError> {
+    pub fn get_kdf_params(&self) -> Result<crate::crypto::KdfParams, PassKeepError> {
         self.conn
             .query_row(
                 "SELECT kdf_salt, kdf_mem_cost, kdf_time_cost, kdf_parallelism FROM vault_metadata WHERE id = 1",
@@ -142,7 +149,7 @@ impl Database {
                     let mut salt = [0u8; 32];
                     salt.copy_from_slice(&salt_bytes[..salt_bytes.len().min(32)]);
 
-                    Ok(KdfParams {
+                    Ok(crate::crypto::KdfParams {
                         salt,
                         mem_cost_kib: row.get(1)?,
                         time_cost: row.get(2)?,

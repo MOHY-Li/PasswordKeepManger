@@ -5,8 +5,8 @@
 use crate::crypto::MasterKey;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use zeroize::Zeroize;
 
 pub mod unlock;

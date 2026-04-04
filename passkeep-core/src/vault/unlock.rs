@@ -9,8 +9,8 @@ use crate::crypto::argon2;
 use crate::crypto::hkdf;
 use crate::crypto::keyfile::KeyFile;
 use crate::models::KdfParams;
-use crate::storage::Database;
 use crate::storage::error::PassKeepError;
+use crate::storage::Database;
 use std::path::Path;
 use zeroize::Zeroizing;
 

@@ -14,7 +14,7 @@ pub use crypto::{KdfParams, MasterKey};
 pub use models::{Entry, EntryInput, EntryMetadata, VaultMetadata};
 pub use storage::error::PassKeepError;
 pub use storage::Database;
-pub use vault::{VaultHandle, VaultManager, VaultSession, VaultDb};
+pub use vault::{VaultDb, VaultHandle, VaultManager, VaultSession};
 
 /// 库版本
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

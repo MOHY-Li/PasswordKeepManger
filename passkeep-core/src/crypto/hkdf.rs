@@ -10,11 +10,7 @@ use sha2::Sha256;
 /// * `salt` - HKDF salt（来自数据库）
 /// * `ikm` - 输入密钥材料（来自密钥文件）
 /// * `output` - 输出缓冲区
-pub fn expand(
-    salt: &[u8; 32],
-    ikm: &[u8; 32],
-    output: &mut [u8; 32],
-) -> Result<(), PassKeepError> {
+pub fn expand(salt: &[u8; 32], ikm: &[u8; 32], output: &mut [u8; 32]) -> Result<(), PassKeepError> {
     let hkdf = Hkdf::<Sha256>::new(Some(salt), ikm);
     hkdf.expand(b"passkeep-argon2-salt", output)
         .map_err(|_| PassKeepError::KeyDerivationFailed)?;

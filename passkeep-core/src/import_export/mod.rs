@@ -10,3 +10,6 @@ pub use format::{
     EXPORT_VERSION, VERIFICATION_VALUE,
 };
 pub use json_exporter::{export_vault, verify_integrity_hash, ExportOptions};
+pub use json_importer::{
+    import_vault, ConflictStrategy, ImportOptions, ImportResult,
+};

@@ -8,7 +8,7 @@ use crate::crypto::rng;
 use crate::crypto::MasterKey;
 use crate::import_export::format::{
     ExportDocument, ExportedEntry, ExportedFolder, ExportMetadata, EXPORT_FORMAT,
-    EXPORT_VERSION, VERIFICATION_VALUE,
+    EXPORT_VERSION, MAX_URL_PREVIEW_LENGTH, VERIFICATION_VALUE,
 };
 use crate::models::Entry;
 use crate::storage::error::PassKeepError;
@@ -84,7 +84,9 @@ pub fn export_vault(
     let json = serde_json::to_string_pretty(&document)?;
 
     if options.encrypt_full_file {
-        // TODO: Implement full file encryption in future phase
+        // Note: Full file encryption is planned for a future phase.
+        // Returning EncryptionFailed to maintain error type consistency.
+        // When implemented, this will encrypt the entire JSON output.
         return Err(PassKeepError::EncryptionFailed);
     }
 
@@ -128,7 +130,7 @@ fn export_entry(entry: &Entry, master_key: &MasterKey) -> Result<ExportedEntry, 
         url_preview: entry
             .url
             .as_ref()
-            .map(|u| u.chars().take(50).collect())
+            .map(|u| u.chars().take(MAX_URL_PREVIEW_LENGTH).collect())
             .unwrap_or_default(),
         url_encrypted,
         notes_encrypted,
@@ -208,7 +210,7 @@ mod tests {
         assert_eq!(exported.username, "testuser");
         assert!(!exported.password_encrypted.is_empty());
         assert!(!exported.password_nonce.is_empty());
-        assert_eq!(exported.url_preview.len(), 50); // URL truncated to 50 chars
+        assert_eq!(exported.url_preview.len(), MAX_URL_PREVIEW_LENGTH); // URL truncated to MAX_URL_PREVIEW_LENGTH chars
         assert!(exported.url_encrypted.is_some());
         assert!(exported.url_nonce.is_some());
         assert!(exported.notes_encrypted.is_some());
@@ -369,7 +371,7 @@ mod tests {
         };
 
         let exported = export_entry(&entry, &master_key).unwrap();
-        assert_eq!(exported.url_preview.len(), 50);
-        assert_eq!(&exported.url_preview, &long_url[..50]);
+        assert_eq!(exported.url_preview.len(), MAX_URL_PREVIEW_LENGTH);
+        assert_eq!(&exported.url_preview, &long_url[..MAX_URL_PREVIEW_LENGTH]);
     }
 }

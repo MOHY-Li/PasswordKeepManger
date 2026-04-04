@@ -14,6 +14,9 @@ pub const EXPORT_VERSION: u32 = 1;
 /// Verification value to encrypt (validates master key on import)
 pub const VERIFICATION_VALUE: &str = "PASSKEEP-VERIFICATION";
 
+/// Maximum length for URL preview (truncated for display)
+pub const MAX_URL_PREVIEW_LENGTH: usize = 50;
+
 /// Export metadata
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ExportMetadata {

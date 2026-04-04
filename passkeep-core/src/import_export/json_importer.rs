@@ -18,22 +18,17 @@ use base64::prelude::*;
 use std::collections::HashSet;
 
 /// Import conflict resolution strategy
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ConflictStrategy {
     /// Skip conflicting entries, keep existing data
     Skip,
     /// Overwrite existing entries with imported data
     Overwrite,
     /// Generate new UUID for imported entries (recommended, default)
+    #[default]
     Rename,
     /// Abort entire import on any conflict
     Abort,
-}
-
-impl Default for ConflictStrategy {
-    fn default() -> Self {
-        Self::Rename
-    }
 }
 
 /// Import options
@@ -130,9 +125,7 @@ pub fn import_vault(
             }
             ImportEntryResult::ImportedWithNewId(original_id, entry) => {
                 result.entries_imported += 1;
-                result
-                    .id_mapping
-                    .push((original_id, entry.id.clone()));
+                result.id_mapping.push((original_id, entry.id.clone()));
                 imported_entries.push(entry);
             }
             ImportEntryResult::Skipped(id) => {
@@ -237,9 +230,11 @@ fn decrypt_field(
     nonce_b64: &str,
     master_key: &MasterKey,
 ) -> Result<String, PassKeepError> {
-    let encrypted = BASE64_STANDARD.decode(encrypted_b64)
+    let encrypted = BASE64_STANDARD
+        .decode(encrypted_b64)
         .map_err(|_| PassKeepError::DecryptionFailed)?;
-    let nonce_bytes = BASE64_STANDARD.decode(nonce_b64)
+    let nonce_bytes = BASE64_STANDARD
+        .decode(nonce_b64)
         .map_err(|_| PassKeepError::DecryptionFailed)?;
 
     if nonce_bytes.len() != 12 {
@@ -367,7 +362,10 @@ mod tests {
                 // but the test entry decryption might also fail with DecryptionFailed
                 // Both are acceptable outcomes for wrong master key
                 assert!(
-                    matches!(e, PassKeepError::WrongPassword | PassKeepError::DecryptionFailed),
+                    matches!(
+                        e,
+                        PassKeepError::WrongPassword | PassKeepError::DecryptionFailed
+                    ),
                     "Expected WrongPassword or DecryptionFailed, got: {:?}",
                     e
                 );

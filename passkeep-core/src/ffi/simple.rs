@@ -66,7 +66,9 @@ impl From<PassKeepError> for ErrorCode {
             PassKeepError::WrongPassword => ErrorCode::WrongPassword,
             PassKeepError::VaultLocked(_) => ErrorCode::VaultLocked,
             PassKeepError::KeyFileNotFound(_) => ErrorCode::KeyFileNotFound,
-            PassKeepError::KeyFileInvalid | PassKeepError::KeyFileCorrupted => ErrorCode::KeyFileInvalid,
+            PassKeepError::KeyFileInvalid | PassKeepError::KeyFileCorrupted => {
+                ErrorCode::KeyFileInvalid
+            }
             PassKeepError::DatabaseLocked => ErrorCode::DatabaseLocked,
             PassKeepError::EntryNotFound(_) => ErrorCode::EntryNotFound,
             PassKeepError::EncryptionFailed => ErrorCode::EncryptionFailed,
@@ -94,7 +96,7 @@ impl From<PassKeepError> for ErrorCode {
 }
 
 thread_local! {
-    static LAST_ERROR: Mutex<Option<CString>> = Mutex::new(None);
+    static LAST_ERROR: Mutex<Option<CString>> = const { Mutex::new(None) };
 }
 
 /// Set the last error message from a PassKeepError
@@ -159,7 +161,10 @@ impl VaultManagerWrapper {
 
     fn add_session(&self, handle: VaultHandle, session: VaultSession) -> Result<(), ErrorCode> {
         self.with_manager(|m| {
-            m.vaults.lock().unwrap().insert(handle, Arc::new(Mutex::new(session)));
+            m.vaults
+                .lock()
+                .unwrap()
+                .insert(handle, Arc::new(Mutex::new(session)));
             Ok(())
         })
     }
@@ -257,9 +262,11 @@ pub extern "C" fn passkeep_create_vault(
         );
 
         // Generate handle and store session
-        let handle = GLOBAL_VAULT_MANAGER.next_handle()
+        let handle = GLOBAL_VAULT_MANAGER
+            .next_handle()
             .map_err(|_| PassKeepError::DatabaseLocked)?;
-        GLOBAL_VAULT_MANAGER.add_session(handle, session)
+        GLOBAL_VAULT_MANAGER
+            .add_session(handle, session)
             .map_err(|_| PassKeepError::DatabaseLocked)?;
 
         Ok(handle)
@@ -338,9 +345,11 @@ pub extern "C" fn passkeep_unlock_vault(
         );
 
         // Generate handle and store session
-        let handle = GLOBAL_VAULT_MANAGER.next_handle()
+        let handle = GLOBAL_VAULT_MANAGER
+            .next_handle()
             .map_err(|_| PassKeepError::DatabaseLocked)?;
-        GLOBAL_VAULT_MANAGER.add_session(handle, session)
+        GLOBAL_VAULT_MANAGER
+            .add_session(handle, session)
             .map_err(|_| PassKeepError::DatabaseLocked)?;
 
         Ok(handle)
@@ -787,10 +796,16 @@ mod tests {
     fn test_error_code_conversion() {
         assert_eq!(ErrorCode::from(PassKeepError::WrongPassword) as i32, 1);
         assert_eq!(ErrorCode::from(PassKeepError::VaultLocked(0)) as i32, 2);
-        assert_eq!(ErrorCode::from(PassKeepError::KeyFileNotFound("".to_string())) as i32, 3);
+        assert_eq!(
+            ErrorCode::from(PassKeepError::KeyFileNotFound("".to_string())) as i32,
+            3
+        );
         assert_eq!(ErrorCode::from(PassKeepError::KeyFileInvalid) as i32, 4);
         assert_eq!(ErrorCode::from(PassKeepError::DatabaseLocked) as i32, 5);
-        assert_eq!(ErrorCode::from(PassKeepError::EntryNotFound("".to_string())) as i32, 6);
+        assert_eq!(
+            ErrorCode::from(PassKeepError::EntryNotFound("".to_string())) as i32,
+            6
+        );
     }
 
     #[test]
@@ -810,11 +825,8 @@ mod tests {
         let keyfile_path_c = CString::new(keyfile_path.to_str().unwrap()).unwrap();
         let mut handle: VaultHandleC = 0;
 
-        let result = passkeep_create_vault(
-            db_path_c.as_ptr(),
-            keyfile_path_c.as_ptr(),
-            &mut handle,
-        );
+        let result =
+            passkeep_create_vault(db_path_c.as_ptr(), keyfile_path_c.as_ptr(), &mut handle);
 
         assert_eq!(result, ErrorCode::Success as i32);
         assert!(handle > 0);
@@ -861,11 +873,8 @@ mod tests {
         let keyfile_path_c = CString::new(keyfile_path.to_str().unwrap()).unwrap();
         let mut handle: VaultHandleC = 0;
 
-        let result = passkeep_create_vault(
-            db_path_c.as_ptr(),
-            keyfile_path_c.as_ptr(),
-            &mut handle,
-        );
+        let result =
+            passkeep_create_vault(db_path_c.as_ptr(), keyfile_path_c.as_ptr(), &mut handle);
         assert_eq!(result, ErrorCode::Success as i32);
 
         let result = passkeep_close_vault(handle);
@@ -887,11 +896,8 @@ mod tests {
         let keyfile_path_c = CString::new(keyfile_path.to_str().unwrap()).unwrap();
         let mut handle: VaultHandleC = 0;
 
-        let result = passkeep_create_vault(
-            db_path_c.as_ptr(),
-            keyfile_path_c.as_ptr(),
-            &mut handle,
-        );
+        let result =
+            passkeep_create_vault(db_path_c.as_ptr(), keyfile_path_c.as_ptr(), &mut handle);
         assert_eq!(result, ErrorCode::Success as i32);
 
         let mut is_locked = 0;
@@ -918,11 +924,8 @@ mod tests {
         let keyfile_path_c = CString::new(keyfile_path.to_str().unwrap()).unwrap();
         let mut handle: VaultHandleC = 0;
 
-        let result = passkeep_create_vault(
-            db_path_c.as_ptr(),
-            keyfile_path_c.as_ptr(),
-            &mut handle,
-        );
+        let result =
+            passkeep_create_vault(db_path_c.as_ptr(), keyfile_path_c.as_ptr(), &mut handle);
         assert_eq!(result, ErrorCode::Success as i32);
 
         // Close the vault first to release database lock
@@ -935,9 +938,11 @@ mod tests {
         let result = passkeep_get_lock_remaining(db_path_c.as_ptr(), &mut remaining);
         // The function should either succeed or fail gracefully (not panic)
         // DatabaseLocked is acceptable if the WAL file hasn't been cleaned up yet
-        assert!(result == ErrorCode::Success as i32 ||
-                result == ErrorCode::DatabaseLocked as i32 ||
-                result == ErrorCode::DatabaseCorrupted as i32);
+        assert!(
+            result == ErrorCode::Success as i32
+                || result == ErrorCode::DatabaseLocked as i32
+                || result == ErrorCode::DatabaseCorrupted as i32
+        );
     }
 
     #[test]
@@ -951,11 +956,7 @@ mod tests {
         let mut handle: VaultHandleC = 0;
 
         // This should fail with IO error
-        let _ = passkeep_create_vault(
-            db_path_c.as_ptr(),
-            keyfile_path_c.as_ptr(),
-            &mut handle,
-        );
+        let _ = passkeep_create_vault(db_path_c.as_ptr(), keyfile_path_c.as_ptr(), &mut handle);
 
         // Check that error message is set
         let error_ptr = passkeep_get_last_error();
@@ -977,11 +978,8 @@ mod tests {
         let keyfile_path = CString::new("test.key").unwrap();
         let mut handle: VaultHandleC = 0;
 
-        let result = passkeep_create_vault(
-            invalid_path.as_ptr(),
-            keyfile_path.as_ptr(),
-            &mut handle,
-        );
+        let result =
+            passkeep_create_vault(invalid_path.as_ptr(), keyfile_path.as_ptr(), &mut handle);
 
         // Should return an error (may be IoError or InvalidUtf8)
         assert_ne!(result, ErrorCode::Success as i32);
@@ -997,11 +995,8 @@ mod tests {
         let keyfile_path_c = CString::new(keyfile_path.to_str().unwrap()).unwrap();
         let mut handle: VaultHandleC = 0;
 
-        let result = passkeep_create_vault(
-            db_path_c.as_ptr(),
-            keyfile_path_c.as_ptr(),
-            &mut handle,
-        );
+        let result =
+            passkeep_create_vault(db_path_c.as_ptr(), keyfile_path_c.as_ptr(), &mut handle);
         assert_eq!(result, ErrorCode::Success as i32);
 
         // Lock the vault
@@ -1025,11 +1020,8 @@ mod tests {
         let keyfile_path_c = CString::new(keyfile_path.to_str().unwrap()).unwrap();
         let mut handle: VaultHandleC = 0;
 
-        let result = passkeep_create_vault(
-            db_path_c.as_ptr(),
-            keyfile_path_c.as_ptr(),
-            &mut handle,
-        );
+        let result =
+            passkeep_create_vault(db_path_c.as_ptr(), keyfile_path_c.as_ptr(), &mut handle);
         assert_eq!(result, ErrorCode::Success as i32);
 
         let mut entries = std::ptr::null_mut();

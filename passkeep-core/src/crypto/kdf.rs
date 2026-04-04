@@ -20,7 +20,7 @@ impl KdfParams {
     pub fn default_params() -> Self {
         Self {
             salt: [0u8; 32],
-            mem_cost_kib: 262144,  // 256 MiB
+            mem_cost_kib: 262144, // 256 MiB
             time_cost: 3,
             parallelism: 4,
         }

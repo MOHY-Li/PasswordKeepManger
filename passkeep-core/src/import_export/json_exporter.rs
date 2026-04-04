@@ -7,8 +7,8 @@ use crate::crypto::aes;
 use crate::crypto::rng;
 use crate::crypto::MasterKey;
 use crate::import_export::format::{
-    ExportDocument, ExportedEntry, ExportedFolder, ExportMetadata, EXPORT_FORMAT,
-    EXPORT_VERSION, MAX_URL_PREVIEW_LENGTH, VERIFICATION_VALUE,
+    ExportDocument, ExportMetadata, ExportedEntry, ExportedFolder, EXPORT_FORMAT, EXPORT_VERSION,
+    MAX_URL_PREVIEW_LENGTH, VERIFICATION_VALUE,
 };
 use crate::models::Entry;
 use crate::storage::error::PassKeepError;
@@ -107,7 +107,8 @@ fn export_entry(entry: &Entry, master_key: &MasterKey) -> Result<ExportedEntry, 
     // Encrypt URL if present
     let (url_encrypted, url_nonce) = if let Some(ref url) = entry.url {
         let nonce = rng::generate_nonce();
-        let encrypted = aes::encrypt_with_nonce(url.as_bytes(), master_key.as_bytes(), &nonce, b"")?;
+        let encrypted =
+            aes::encrypt_with_nonce(url.as_bytes(), master_key.as_bytes(), &nonce, b"")?;
         (Some(BASE64_STANDARD.encode(encrypted)), Some(nonce))
     } else {
         (None, None)
@@ -116,7 +117,8 @@ fn export_entry(entry: &Entry, master_key: &MasterKey) -> Result<ExportedEntry, 
     // Encrypt notes if present
     let (notes_encrypted, notes_nonce) = if let Some(ref notes) = entry.notes {
         let nonce = rng::generate_nonce();
-        let encrypted = aes::encrypt_with_nonce(notes.as_bytes(), master_key.as_bytes(), &nonce, b"")?;
+        let encrypted =
+            aes::encrypt_with_nonce(notes.as_bytes(), master_key.as_bytes(), &nonce, b"")?;
         (Some(BASE64_STANDARD.encode(encrypted)), Some(nonce))
     } else {
         (None, None)
@@ -150,10 +152,8 @@ fn calculate_integrity_hash(
     folders: &[ExportedFolder],
 ) -> Result<[u8; 32], PassKeepError> {
     // Serialize entries and folders separately for hashing
-    let entries_json = serde_json::to_vec(entries)
-        .map_err(|_| PassKeepError::EncryptionFailed)?;
-    let folders_json = serde_json::to_vec(folders)
-        .map_err(|_| PassKeepError::EncryptionFailed)?;
+    let entries_json = serde_json::to_vec(entries).map_err(|_| PassKeepError::EncryptionFailed)?;
+    let folders_json = serde_json::to_vec(folders).map_err(|_| PassKeepError::EncryptionFailed)?;
 
     // Use hash_chunks to compute hash of both arrays
     Ok(crate::crypto::hash_chunks(&[&entries_json, &folders_json]))
@@ -167,7 +167,8 @@ fn calculate_integrity_hash(
 /// # Returns
 /// Ok(()) if hash is valid, Err otherwise
 pub fn verify_integrity_hash(document: &ExportDocument) -> Result<(), PassKeepError> {
-    let expected_hash = BASE64_STANDARD.decode(&document.metadata.integrity_hash)
+    let expected_hash = BASE64_STANDARD
+        .decode(&document.metadata.integrity_hash)
         .map_err(|_| PassKeepError::InvalidExportFormat)?;
 
     let calculated_hash = calculate_integrity_hash(&document.entries, &document.folders)?;
@@ -189,7 +190,9 @@ mod tests {
             title: "Test Entry".to_string(),
             username: "testuser".to_string(),
             password: "password123".to_string(),
-            url: Some("https://example.com/very/long/url/that/has/more/than/fifty/characters".to_string()),
+            url: Some(
+                "https://example.com/very/long/url/that/has/more/than/fifty/characters".to_string(),
+            ),
             notes: Some("Secret notes".to_string()),
             folder_id: None,
             tags: vec!["test".to_string()],

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["V2_SCHEMA_SQL"],"fn":["apply_v2_migration"]};

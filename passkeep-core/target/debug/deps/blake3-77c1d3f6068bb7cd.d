@@ -1,0 +1,12 @@
+/Users/moyang/Desktop/Code/passwordmanger/.worktrees/phase2-vault-operations/passkeep-core/target/debug/deps/blake3-77c1d3f6068bb7cd.d: /Users/moyang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.4/src/lib.rs /Users/moyang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.4/src/guts.rs /Users/moyang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.4/src/hazmat.rs /Users/moyang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.4/src/platform.rs /Users/moyang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.4/src/ffi_neon.rs /Users/moyang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.4/src/portable.rs /Users/moyang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.4/src/io.rs /Users/moyang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.4/src/join.rs
+
+/Users/moyang/Desktop/Code/passwordmanger/.worktrees/phase2-vault-operations/passkeep-core/target/debug/deps/libblake3-77c1d3f6068bb7cd.rmeta: /Users/moyang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.4/src/lib.rs /Users/moyang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.4/src/guts.rs /Users/moyang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.4/src/hazmat.rs /Users/moyang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.4/src/platform.rs /Users/moyang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.4/src/ffi_neon.rs /Users/moyang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.4/src/portable.rs /Users/moyang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.4/src/io.rs /Users/moyang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.4/src/join.rs
+
+/Users/moyang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.4/src/lib.rs:
+/Users/moyang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.4/src/guts.rs:
+/Users/moyang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.4/src/hazmat.rs:
+/Users/moyang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.4/src/platform.rs:
+/Users/moyang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.4/src/ffi_neon.rs:
+/Users/moyang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.4/src/portable.rs:
+/Users/moyang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.4/src/io.rs:
+/Users/moyang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.4/src/join.rs:

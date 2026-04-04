@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["KEYFILE_MAGIC","KEYFILE_SIZE","KEYFILE_VERSION"],"struct":["KeyFile"]};

@@ -56,6 +56,7 @@ pub enum ErrorCode {
     NullPointer = 22,
     InvalidUtf8 = 23,
     AllocationFailed = 24,
+    NotImplemented = 25,
     Unknown = -1,
 }
 
@@ -92,7 +93,6 @@ impl From<PassKeepError> for ErrorCode {
     }
 }
 
-/// Thread-local storage for the last error message
 thread_local! {
     static LAST_ERROR: Mutex<Option<CString>> = Mutex::new(None);
 }
@@ -532,7 +532,7 @@ pub extern "C" fn passkeep_create_entry(
     _entry: *const PasskeepEntry,
 ) -> i32 {
     // TODO: Implement in Phase 3
-    ErrorCode::EntryNotFound as i32
+    ErrorCode::NotImplemented as i32
 }
 
 /// Get a password entry by ID.
@@ -557,7 +557,7 @@ pub extern "C" fn passkeep_get_entry(
         return ErrorCode::NullPointer as i32;
     }
     // TODO: Implement in Phase 3
-    ErrorCode::EntryNotFound as i32
+    ErrorCode::NotImplemented as i32
 }
 
 /// List all entries in the vault.
@@ -615,7 +615,7 @@ pub extern "C" fn passkeep_update_entry(
         return ErrorCode::NullPointer as i32;
     }
     // TODO: Implement in Phase 3
-    ErrorCode::EntryNotFound as i32
+    ErrorCode::NotImplemented as i32
 }
 
 /// Delete a password entry.
@@ -635,7 +635,7 @@ pub extern "C" fn passkeep_delete_entry(_handle: VaultHandleC, id: *const c_char
         return ErrorCode::NullPointer as i32;
     }
     // TODO: Implement in Phase 3
-    ErrorCode::EntryNotFound as i32
+    ErrorCode::NotImplemented as i32
 }
 
 // ============================================================================
@@ -664,7 +664,7 @@ pub extern "C" fn passkeep_export_vault(
         return ErrorCode::NullPointer as i32;
     }
     // TODO: Implement in Phase 3 with proper session management
-    ErrorCode::EntryNotFound as i32
+    ErrorCode::NotImplemented as i32
 }
 
 /// Import vault data from a JSON file.
@@ -689,7 +689,7 @@ pub extern "C" fn passkeep_import_vault(
         return ErrorCode::NullPointer as i32;
     }
     // TODO: Implement in Phase 3 with proper session management
-    ErrorCode::EntryNotFound as i32
+    ErrorCode::NotImplemented as i32
 }
 
 // ============================================================================
